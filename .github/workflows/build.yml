@@ -73,6 +73,11 @@ jobs:
             | tar -xz -C "$o" --strip-components=1
           sed -i 's/^# if defined(__FreeBSD__) && defined(IN6_IS_ADDR_V4MAPPED)$/& \&\& !defined(__PS4__)/' "$o/crypto/bio/bss_dgram.c"
           grep -q 'IN6_IS_ADDR_V4MAPPED) && !defined(__PS4__)' "$o/crypto/bio/bss_dgram.c"
+          # curl: musl's headers define the Linux-only IP_BIND_ADDRESS_NO_PORT but OpenOrbis has no SOL_IP.
+          c="$PSB/src/deps/curl"; mkdir -p "$c"
+          curl -fsSL https://curl.se/download/curl-8.14.1.tar.xz | tar -xJ -C "$c" --strip-components=1
+          sed -i 's/^#ifdef IP_BIND_ADDRESS_NO_PORT$/#if defined(IP_BIND_ADDRESS_NO_PORT) \&\& !defined(__PS4__)/' "$c/lib/cf-socket.c"
+          test "$(grep -c 'IP_BIND_ADDRESS_NO_PORT) && !defined(__PS4__)' "$c/lib/cf-socket.c")" -ge 1
           scripts/build-deps.sh
 
       - name: Cache Mesa
