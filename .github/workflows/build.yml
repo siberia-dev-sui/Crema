@@ -65,6 +65,14 @@ jobs:
         run: |
           toolchain/build-libcxx.sh
           toolchain/build-runtime.sh
+          # OpenSSL: the freebsd12 target defines __FreeBSD__, so bss_dgram.c redefines s6_addr32
+          # with BSD's __u6_addr, which OpenOrbis' musl in6_addr doesn't have. Pre-seed the source
+          # (build-deps.sh's fetch skips existing dirs) with that block disabled for the PS4.
+          o="$PSB/src/deps/openssl"; mkdir -p "$o"
+          curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz \
+            | tar -xz -C "$o" --strip-components=1
+          sed -i 's/^# if defined(__FreeBSD__) && defined(IN6_IS_ADDR_V4MAPPED)$/& \&\& !defined(__PS4__)/' "$o/crypto/bio/bss_dgram.c"
+          grep -q 'IN6_IS_ADDR_V4MAPPED) && !defined(__PS4__)' "$o/crypto/bio/bss_dgram.c"
           scripts/build-deps.sh
 
       - name: Cache Mesa
