@@ -155,6 +155,10 @@ jobs:
         run: |
           # Sony .sprx modules are never redistributed: package with an empty modules folder.
           mkdir -p "$RUNNER_TEMP/no-modules"
+          # Install next to the official Crema (CREM00001) as "Crema Dev": same /data/Crema, so
+          # both builds run the same games, settings and caches and can be compared on the console.
+          sed -i 's/ CREM00001 "Crema" / CRDV00001 "Crema Dev" /; s/ CREMA "\$PS4_BUILD_ROOT\/out"/ CREMADEV "$PS4_BUILD_ROOT\/out"/' scripts/package-cemu.sh
+          grep -q 'CRDV00001 "Crema Dev"' scripts/package-cemu.sh
           DOLPHIN_PS4_MODULES_DIR="$RUNNER_TEMP/no-modules" \
             CEMU_PS4_VERSION="${CEMU_PS4_VERSION:-99.$(printf '%02d' $((GITHUB_RUN_NUMBER % 100)))}" \
             scripts/package-cemu.sh
