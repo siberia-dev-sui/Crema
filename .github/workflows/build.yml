@@ -45,7 +45,7 @@ jobs:
 
       - name: Cache toolchain and sysroot
         id: cache-sysroot
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             /opt/pacbrew
@@ -80,9 +80,18 @@ jobs:
           test "$(grep -c 'IP_BIND_ADDRESS_NO_PORT) && !defined(__PS4__)' "$c/lib/cf-socket.c")" -ge 1
           scripts/build-deps.sh
 
+      - name: Save toolchain and sysroot
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/pacbrew
+            ${{ env.PSB }}/sysroot
+          key: sysroot-v1-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh') }}
+
       - name: Cache Mesa
         id: cache-mesa
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.PSB }}/build/mesa
           key: mesa-v1-${{ env.MESA_TAG }}-${{ hashFiles('patches/mesa-ps4.patch', 'port/mesa/**', 'scripts/build-mesa.sh', 'toolchain/**') }}
@@ -98,6 +107,13 @@ jobs:
           "$PSB/mesa-venv/bin/pip" install -q meson mako pyyaml packaging
           ln -sf "$(command -v glslangValidator)" "$PSB/host-tools/bin/glslangValidator"
           scripts/build-mesa.sh setup
+
+      - name: Save Mesa
+        if: steps.cache-mesa.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PSB }}/build/mesa
+          key: mesa-v1-${{ env.MESA_TAG }}-${{ hashFiles('patches/mesa-ps4.patch', 'port/mesa/**', 'scripts/build-mesa.sh', 'toolchain/**') }}
 
       - name: Cemu source
         run: |
@@ -121,6 +137,16 @@ jobs:
           scripts/configure-cemu.sh -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           JOBS=4 scripts/build-cemu.sh
           ccache -s
+
+      - name: CMake logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-logs-${{ github.run_number }}
+          path: |
+            ${{ env.PSB }}/build/cemu/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.PSB }}/build/cemu/CMakeCache.txt
+          if-no-files-found: ignore
 
       - name: Package
         run: |
