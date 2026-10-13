@@ -1,0 +1,128 @@
+# Builds the Crema .pkg (Cemu for PS4) the same way as DolphinPS4's BUILDING.md:
+# PacBrew OpenOrbis + clang 21 + libc++ 21 sysroot + Mesa 26.0.8 RADV, then Cemu with
+# patches/cemu-ps4.patch. The toolchain, sysroot and Mesa are cached; Cemu uses ccache.
+name: build
+
+# The workflow lives only on the fork's main; optimization branches stay clean for upstream PRs
+# and are built with: gh workflow run build -f ref=opt/<name>
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch, tag or SHA to build
+        default: main
+  push:
+    branches: [main]
+
+env:
+  PSB: /home/runner/cemups4-build
+  OPENORBIS: /opt/pacbrew/ps4/openorbis
+  MESA_TAG: mesa-26.0.8
+  LIBDRM_TAG: libdrm-2.4.125
+  JOBS: 4
+
+jobs:
+  pkg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake perl python3-pil python3-venv glslang-tools \
+            bison flex pkg-config ccache pacman-package-manager libarchive-tools
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 21
+          sudo apt-get install -y clang-21 lld-21 llvm-21
+          # space-free link to this repo, as scripts/seed-build-tree.sh does
+          ln -sfn "$GITHUB_WORKSPACE" "$HOME/cemups4"
+          sudo mkdir -p /opt/pacbrew && sudo chown -R "$USER" /opt/pacbrew
+
+      - name: Cache toolchain and sysroot
+        id: cache-sysroot
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/pacbrew
+            ${{ env.PSB }}/sysroot
+          key: sysroot-v1-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh') }}
+
+      - name: PacBrew OpenOrbis
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          printf '\n[pacbrew]\nSigLevel = Optional TrustAll\nServer = https://pacman.mydedibox.fr/pacbrew/packages/\n' | sudo tee -a /etc/pacman.conf
+          sudo pacman -Sy --noconfirm
+          sudo pacman -S --noconfirm ps4-openorbis
+          sudo chown -R "$USER" /opt/pacbrew
+
+      - name: Sysroot (libc++ 21, runtime, deps)
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          toolchain/build-libcxx.sh
+          toolchain/build-runtime.sh
+          scripts/build-deps.sh
+
+      - name: Cache Mesa
+        id: cache-mesa
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PSB }}/build/mesa
+          key: mesa-v1-${{ env.MESA_TAG }}-${{ hashFiles('patches/mesa-ps4.patch', 'port/mesa/**', 'scripts/build-mesa.sh', 'toolchain/**') }}
+
+      - name: Mesa RADV
+        if: steps.cache-mesa.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$PSB/src" "$PSB/host-tools/bin"
+          git clone -q --depth 1 -b "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git "$PSB/src/mesa"
+          git -C "$PSB/src/mesa" apply "$GITHUB_WORKSPACE/patches/mesa-ps4.patch"
+          git clone -q --depth 1 -b "$LIBDRM_TAG" https://gitlab.freedesktop.org/mesa/drm.git "$PSB/src/libdrm"
+          python3 -m venv "$PSB/mesa-venv"
+          "$PSB/mesa-venv/bin/pip" install -q meson mako pyyaml packaging
+          ln -sf "$(command -v glslangValidator)" "$PSB/host-tools/bin/glslangValidator"
+          scripts/build-mesa.sh setup
+
+      - name: Cemu source
+        run: |
+          BASE=$(awk '/^base:/{print $2}' patches/BASE.txt)
+          mkdir -p "$PSB/src/Cemu" && cd "$PSB/src/Cemu"
+          git init -q && git remote add origin https://github.com/cemu-project/Cemu
+          git fetch -q --depth 1 origin "$BASE" && git checkout -q FETCH_HEAD
+          git submodule update -q --init --depth 1 dependencies/ZArchive dependencies/imgui dependencies/Vulkan-Headers
+          git apply "$GITHUB_WORKSPACE/patches/cemu-ps4.patch"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-v1-${{ github.sha }}
+          restore-keys: ccache-v1-
+
+      - name: Build Cemu
+        run: |
+          ccache -M 2G
+          scripts/configure-cemu.sh -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          JOBS=4 scripts/build-cemu.sh
+          ccache -s
+
+      - name: Package
+        run: |
+          # Sony .sprx modules are never redistributed: package with an empty modules folder.
+          mkdir -p "$RUNNER_TEMP/no-modules"
+          DOLPHIN_PS4_MODULES_DIR="$RUNNER_TEMP/no-modules" \
+            CEMU_PS4_VERSION="${CEMU_PS4_VERSION:-99.$(printf '%02d' $((GITHUB_RUN_NUMBER % 100)))}" \
+            scripts/package-cemu.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crema-pkg-${{ github.run_number }}
+          path: out/*.pkg
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crema-symbols-${{ github.run_number }}
+          path: ${{ env.PSB }}/oelf/
+          retention-days: 14
