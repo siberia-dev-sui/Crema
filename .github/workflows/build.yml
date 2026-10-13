@@ -134,7 +134,11 @@ jobs:
       - name: Build Cemu
         run: |
           ccache -M 2G
-          scripts/configure-cemu.sh -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # ps4-love-style.cmake's --wrap=pthread_create/open linker flags also reach CMake's
+          # try_compile tests, which lack the wrappers: FindThreads fails on a fresh build dir.
+          # pthreads are in the OpenOrbis libc/libkernel, so pre-seed the result.
+          scripts/configure-cemu.sh -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_HAVE_LIBC_PTHREAD=1
           JOBS=4 scripts/build-cemu.sh
           ccache -s
 
