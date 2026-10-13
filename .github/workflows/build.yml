@@ -39,6 +39,8 @@ jobs:
           sudo apt-get install -y clang-21 lld-21 llvm-21
           # space-free link to this repo, as scripts/seed-build-tree.sh does
           ln -sfn "$GITHUB_WORKSPACE" "$HOME/cemups4"
+          # the repo is committed from Windows: no executable bits
+          chmod +x toolchain/*.sh toolchain/bin/* scripts/*.sh scripts/*.py
           sudo mkdir -p /opt/pacbrew && sudo chown -R "$USER" /opt/pacbrew
 
       - name: Cache toolchain and sysroot
