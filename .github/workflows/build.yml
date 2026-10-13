@@ -115,6 +115,15 @@ jobs:
           path: ${{ env.PSB }}/build/mesa
           key: mesa-v1-${{ env.MESA_TAG }}-${{ hashFiles('patches/mesa-ps4.patch', 'port/mesa/**', 'scripts/build-mesa.sh', 'toolchain/**') }}
 
+      - name: PacBrew libjpeg-turbo
+        # Crema's launcher links PacBrew's libturbojpeg.a (src/gui/ps4/CMakeLists.txt) for GameTDB covers
+        run: |
+          if [ ! -f "$OPENORBIS/usr/lib/libturbojpeg.a" ]; then
+            curl -fsSL https://pacman.mydedibox.fr/pacbrew/packages/ps4-openorbis-libjpeg-turbo-2.1.2-2-any.pkg.tar.xz \
+              | tar -xJ -C / opt
+          fi
+          test -f "$OPENORBIS/usr/lib/libturbojpeg.a"
+
       - name: Cemu source
         run: |
           BASE=$(awk '/^base:/{print $2}' patches/BASE.txt)
