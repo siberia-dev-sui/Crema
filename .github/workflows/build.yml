@@ -50,7 +50,7 @@ jobs:
           path: |
             /opt/pacbrew
             ${{ env.PSB }}/sysroot
-          key: sysroot-v1-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh') }}
+          key: sysroot-v2-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh') }}
 
       - name: PacBrew OpenOrbis
         if: steps.cache-sysroot.outputs.cache-hit != 'true'
@@ -65,19 +65,8 @@ jobs:
         run: |
           toolchain/build-libcxx.sh
           toolchain/build-runtime.sh
-          # OpenSSL: the freebsd12 target defines __FreeBSD__, so bss_dgram.c redefines s6_addr32
-          # with BSD's __u6_addr, which OpenOrbis' musl in6_addr doesn't have. Pre-seed the source
-          # (build-deps.sh's fetch skips existing dirs) with that block disabled for the PS4.
-          o="$PSB/src/deps/openssl"; mkdir -p "$o"
-          curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz \
-            | tar -xz -C "$o" --strip-components=1
-          sed -i 's/^# if defined(__FreeBSD__) && defined(IN6_IS_ADDR_V4MAPPED)$/& \&\& !defined(__PS4__)/' "$o/crypto/bio/bss_dgram.c"
-          grep -q 'IN6_IS_ADDR_V4MAPPED) && !defined(__PS4__)' "$o/crypto/bio/bss_dgram.c"
-          # curl: musl's headers define the Linux-only IP_BIND_ADDRESS_NO_PORT but OpenOrbis has no SOL_IP.
-          c="$PSB/src/deps/curl"; mkdir -p "$c"
-          curl -fsSL https://curl.se/download/curl-8.14.1.tar.xz | tar -xJ -C "$c" --strip-components=1
-          sed -i 's/^#ifdef IP_BIND_ADDRESS_NO_PORT$/#if defined(IP_BIND_ADDRESS_NO_PORT) \&\& !defined(__PS4__)/' "$c/lib/cf-socket.c"
-          test "$(grep -c 'IP_BIND_ADDRESS_NO_PORT) && !defined(__PS4__)' "$c/lib/cf-socket.c")" -ge 1
+          # Crema's FreeBSD-layout socket/netinet/poll/fcntl/endian headers over DolphinPS4's overlay
+          scripts/install-overlay.sh
           scripts/build-deps.sh
 
       - name: Save toolchain and sysroot
@@ -87,7 +76,7 @@ jobs:
           path: |
             /opt/pacbrew
             ${{ env.PSB }}/sysroot
-          key: sysroot-v1-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh') }}
+          key: sysroot-v2-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh') }}
 
       - name: Cache Mesa
         id: cache-mesa
