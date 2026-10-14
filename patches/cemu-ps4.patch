@@ -541,7 +541,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..b9a8b9c 100644
+index c9758f3..c7ac766 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1144,7 +1144,7 @@ index c9758f3..b9a8b9c 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +941,115 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +941,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1247,6 +1247,7 @@ index c9758f3..b9a8b9c 100644
 +#ifdef __ORBIS__
 +static bool CremaWarmTake(uint32& address);
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
++extern "C" void ps4_keep_to_helper_cluster(); // port/ps4_runtime.cpp: cores 4-6, away from the emulation
 +extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +#endif
 +
@@ -1254,6 +1255,7 @@ index c9758f3..b9a8b9c 100644
  {
 +	t_recompilerWorker = workerIndex;
 +#ifdef __ORBIS__
++	ps4_keep_to_helper_cluster();
 +	// the first worker above the default priority (and profiled); the others take spare time
 +	if (workerIndex == 0)
 +	{
@@ -1264,7 +1266,7 @@ index c9758f3..b9a8b9c 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1082,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1084,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1348,7 +1350,7 @@ index c9758f3..b9a8b9c 100644
  	}
  }
  
-@@ -504,6 +1171,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1173,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1390,7 +1392,7 @@ index c9758f3..b9a8b9c 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1311,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1313,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1398,7 +1400,7 @@ index c9758f3..b9a8b9c 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1405,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1407,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1411,7 +1413,7 @@ index c9758f3..b9a8b9c 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1418,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1420,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -1710,27 +1712,29 @@ index f1556f8..1cc9d33 100644
  }
  
 diff --git a/src/Cafe/HW/Latte/Core/LatteThread.cpp b/src/Cafe/HW/Latte/Core/LatteThread.cpp
-index 743ab67..b1fc494 100644
+index 743ab67..a707228 100644
 --- a/src/Cafe/HW/Latte/Core/LatteThread.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteThread.cpp
-@@ -18,6 +18,10 @@
+@@ -18,6 +18,11 @@
  #include "config/ActiveSettings.h"
  
  #include "Cafe/CafeSystem.h"
 +#if defined(__ORBIS__)
 +extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
++extern "C" void ps4_keep_to_emulation_cluster(); // port/ps4_runtime.cpp: cores 0-3, one L2
 +#endif
  
  LatteGPUState_t LatteGPUState = {};
  
-@@ -115,6 +119,10 @@ void LatteThread_HandleOSScreen()
+@@ -115,6 +120,11 @@ void LatteThread_HandleOSScreen()
  int Latte_ThreadEntry()
  {
  	SetThreadName("LatteThread");
 +#if defined(__ORBIS__)
 +	ps4_sampler_register_thread("LatteThread");
 +	ps4_boost_thread();
++	ps4_keep_to_emulation_cluster();
 +#endif
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
@@ -2808,7 +2812,7 @@ index bb31077..1403d8d 100644
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..b8cd8f2 100644
+index 9fe4bea..abfac1f 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2820,7 +2824,7 @@ index 9fe4bea..b8cd8f2 100644
  static void ConfigureHostFloatingPointEnvironment()
  {
  #if defined(ARCH_X86_64)
-@@ -47,6 +49,11 @@ sint32 activeThreadCount = 0;
+@@ -47,6 +49,12 @@ sint32 activeThreadCount = 0;
  
  void nnNfp_update();
  
@@ -2828,11 +2832,12 @@ index 9fe4bea..b8cd8f2 100644
 +extern "C" void ps4_thread_cpu_tick(); // port/ps4_sampler.cpp
 +extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
++extern "C" void ps4_keep_to_emulation_cluster(); // port/ps4_runtime.cpp: cores 0-3, one L2
 +#endif
  namespace coreinit
  {
  #ifdef __arm64__
-@@ -1180,6 +1187,9 @@ namespace coreinit
+@@ -1180,6 +1188,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -2842,7 +2847,7 @@ index 9fe4bea..b8cd8f2 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1202,63 @@ namespace coreinit
+@@ -1192,6 +1203,63 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -2906,7 +2911,7 @@ index 9fe4bea..b8cd8f2 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1277,9 @@ namespace coreinit
+@@ -1210,6 +1278,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -2916,7 +2921,7 @@ index 9fe4bea..b8cd8f2 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1303,16 @@ namespace coreinit
+@@ -1233,6 +1304,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -2933,7 +2938,7 @@ index 9fe4bea..b8cd8f2 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1391,6 +1471,11 @@ namespace coreinit
+@@ -1391,6 +1472,12 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -2941,11 +2946,12 @@ index 9fe4bea..b8cd8f2 100644
 +		static const char* const kProfiledNames[] = {"OSSched[core=0]", "OSSched[core=1]", "OSSched[core=2]"};
 +		ps4_sampler_register_thread(kProfiledNames[std::min<uintptr_t>((uintptr_t)_assignedCoreIndex, 2)]);
 +		ps4_boost_thread();
++		ps4_keep_to_emulation_cluster();
 +#endif
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1732,159 @@ namespace coreinit
+@@ -1647,3 +1734,159 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }

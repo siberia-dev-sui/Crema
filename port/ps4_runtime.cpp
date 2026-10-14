@@ -884,6 +884,17 @@ extern "C" void ps4_boost_thread() {
     scePthreadSetprio(scePthreadSelf(), 650);
 }
 
+// The PS4's Jaguar cores are two clusters of four (0-3 and 4-7), each with its own 2 MB L2 cache;
+// data written on one cluster and read on the other crosses between the L2s. The emulated CPU
+// cores and the GPU thread share the most data (guest memory, the command buffer), so they keep
+// to cluster 0; the recompiler's workers go to the other cluster, out of their L2.
+extern "C" void ps4_keep_to_emulation_cluster() {
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 0x0F & kAppCores);
+}
+extern "C" void ps4_keep_to_helper_cluster() {
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 0xF0 & kAppCores);
+}
+
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
     // the stack: at least kMinThreadStack
     pthread_attr_t local;
