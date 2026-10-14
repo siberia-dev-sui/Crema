@@ -104,6 +104,37 @@ index 06c2a13..33bea8f 100644
  private:
  	uint64_t m_title_id = 0;
  	bool m_is_loaded = false;
+diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp
+index cf7ba19..70a98c3 100644
+--- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp
++++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp
+@@ -21,6 +21,16 @@ static constexpr size_t HLE_TABLE_CAPACITY = 0x4000;
+ HLECALL s_ppcHleTable[HLE_TABLE_CAPACITY]{};
+ sint32 s_ppcHleTableWriteIndex = 0;
+ std::mutex s_ppcHleTableMutex;
++std::vector<std::string> s_ppcHleNames; // the name each function was first registered with
++
++// Crema (Profiler): "library.function" of an HLE function ID, for the HLE call counts
++std::string PPCInterpreter_getHLEName(HLEIDX funcIndex)
++{
++	std::unique_lock _l(s_ppcHleTableMutex);
++	if (funcIndex < 0 || (size_t)funcIndex >= s_ppcHleNames.size() || s_ppcHleNames[funcIndex].empty())
++		return fmt::format("hle#{}", funcIndex);
++	return s_ppcHleNames[funcIndex];
++}
+ 
+ HLEIDX PPCInterpreter_registerHLECall(HLECALL hleCall, std::string hleName)
+ {
+@@ -41,6 +51,9 @@ HLEIDX PPCInterpreter_registerHLECall(HLECALL hleCall, std::string hleName)
+ 	s_ppcHleTable[s_ppcHleTableWriteIndex] = hleCall;
+ 	HLEIDX funcIndex = s_ppcHleTableWriteIndex;
+ 	s_ppcHleTableWriteIndex++;
++	if (s_ppcHleNames.size() <= (size_t)funcIndex)
++		s_ppcHleNames.resize(funcIndex + 1);
++	s_ppcHleNames[funcIndex] = std::move(hleName);
+ 	return funcIndex;
+ }
+ 
 diff --git a/src/Cafe/HW/Espresso/PPCTimer.cpp b/src/Cafe/HW/Espresso/PPCTimer.cpp
 index 257973a..2d7d62b 100644
 --- a/src/Cafe/HW/Espresso/PPCTimer.cpp
@@ -198,7 +229,7 @@ index 257973a..2d7d62b 100644
  	_rdtscAcc.low = remainder;
  	_rdtscAcc.high = 0;
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..1316a67 100644
+index e466deb..c66c24d 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -9,6 +9,9 @@
@@ -211,7 +242,67 @@ index e466deb..1316a67 100644
  static x86Assembler64::GPR32 _reg32(IMLReg physReg)
  {
  	cemu_assert_debug(physReg.GetRegFormat() == IMLRegFormat::I32);
-@@ -738,6 +741,23 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -153,7 +156,28 @@ void PPCRecompilerX64Gen_redirectRelativeJump(x64GenContext_t* x64GenContext, si
+ 	}
+ }
+ 
+-void* ATTR_MS_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFuncId)
++// The HLE dispatcher uses the host's own calling convention. As an ms_abi function on SysV hosts
++// it saved and restored xmm6-xmm15, rsi and rdi on every HLE call (the MS ABI preserves them, the
++// SysV functions it calls don't), ~2% of the PS4's main core. Nothing of the recompiled code is
++// live across the call: an HLE macro ends its segment, every guest register is stored before it
++// and the next segment loads what it uses.
++#if BOOST_OS_WINDOWS
++#define PPCREC_HLE_ABI ATTR_MS_ABI
++#else
++#define PPCREC_HLE_ABI
++#endif
++
++extern HLECALL s_ppcHleTable[]; // PPCInterpreterHLE.cpp, indexed by the IDs the recompiler emits
++
++#if defined(__ORBIS__)
++// Crema (Profiler): HLE calls from recompiled code, per emulated core and function, reported with
++// the thread census every 30 s (coreinit_Thread.cpp). Off until the census starts. One writer per
++// row (each core's host thread); the reporter reads and clears without a lock, it is a statistic.
++std::atomic<bool> g_crema_count_hle_calls{false};
++uint32 g_crema_hle_calls[4][0x4000];
++#endif
++
++void* PPCREC_HLE_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFuncId)
+ {
+ 	void* prevRSPTemp = hCPU->rspTemp;
+ 	if( hleFuncId == 0xFFD0 )
+@@ -165,8 +189,12 @@ void* ATTR_MS_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFun
+ 	}
+ 	else
+ 	{
+-		auto hleCall = PPCInterpreter_getHLECall(hleFuncId);
++		auto hleCall = s_ppcHleTable[hleFuncId];
+ 		cemu_assert(hleCall != nullptr);
++#if defined(__ORBIS__)
++		if (g_crema_count_hle_calls.load(std::memory_order_relaxed)) [[unlikely]]
++			g_crema_hle_calls[hCPU->spr.UPIR & 3][hleFuncId & 0x3FFF]++;
++#endif
+ 		hleCall(hCPU);
+ 	}
+ 	hCPU->rspTemp = prevRSPTemp;
+@@ -276,9 +304,14 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction,
+ 		uint32 funcId = imlInstruction->op_macro.param2;
+ 		// update instruction pointer
+ 		x64Gen_mov_mem32Reg64_imm32(x64GenContext, REG_RESV_HCPU, offsetof(PPCInterpreter_t, instructionPointer), ppcAddress);
+-		// set parameters
++		// set parameters (PPCREC_HLE_ABI)
++#if BOOST_OS_WINDOWS
+ 		x64Gen_mov_reg64_reg64(x64GenContext, X86_REG_RCX, REG_RESV_HCPU);
+ 		x64Gen_mov_reg64_imm64(x64GenContext, X86_REG_RDX, funcId);
++#else
++		x64Gen_mov_reg64_reg64(x64GenContext, X86_REG_RDI, REG_RESV_HCPU);
++		x64Gen_mov_reg64_imm64(x64GenContext, X86_REG_RSI, funcId);
++#endif
+ 		// restore stackpointer from hCPU->rspTemp
+ 		x64Emit_mov_reg64_mem64(x64GenContext, X86_REG_RSP, REG_RESV_HCPU, offsetof(PPCInterpreter_t, rspTemp));
+ 		// reserve space on stack for call parameters
+@@ -738,6 +771,23 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  			x64Gen_shlx_reg64_reg64_reg64(x64GenContext, rRegResult, rRegOperand1, rRegOperand2);
  			x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
  		}
@@ -235,7 +326,7 @@ index e466deb..1316a67 100644
  		else
  		{
  			// lazy and slow way to do shift by register without relying on ECX/CL or BMI2
-@@ -766,8 +786,19 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -766,8 +816,19 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  	else if( imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE )
  	{
  		// todo: Use BMI2 rotate if available
@@ -541,7 +632,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..c7ac766 100644
+index c9758f3..0dff409 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -590,7 +681,7 @@ index c9758f3..c7ac766 100644
  	std::atomic_int_fast32_t recompilerEnableCount{0};
  	// recompiler thread
  	std::thread workerThread;
-@@ -59,6 +80,260 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +80,302 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -767,8 +858,27 @@ index c9758f3..c7ac766 100644
 +		CremaWarmFlushLocked(false);
 +	}
 +
++	// Every recompiled function's host code range (the ring above keeps only the newest 32768;
++	// Breath of the Wild compiles ~54000), for the profiler to put each sample of recompiled code
++	// on the game function it ran (ps4_jit_guest_functions). Sorted when looked up.
++	struct CremaJitMapEntry
++	{
++		uintptr_t x86Start;
++		uint32 x86Size;
++		uint32 ppcStart;
++	};
++	std::mutex s_cremaJitMapLock;
++	std::vector<CremaJitMapEntry> s_cremaJitMap;
++	bool s_cremaJitMapSorted = true;
++
 +	void CremaJitRecord(PPCRecFunction_t* func)
 +	{
++		{
++			std::lock_guard _l(s_cremaJitMapLock);
++			if (!s_cremaJitMap.empty() && s_cremaJitMap.back().x86Start > (uintptr_t)func->x86Code)
++				s_cremaJitMapSorted = false;
++			s_cremaJitMap.push_back({(uintptr_t)func->x86Code, (uint32)func->x86Size, func->ppcAddress});
++		}
 +		const uint32 slot = s_cremaJitNext.load(std::memory_order_relaxed) % kCremaJitRanges;
 +		CremaJitRange& r = s_cremaJitRanges[slot];
 +		r.x86Start.store(0, std::memory_order_relaxed);
@@ -777,6 +887,29 @@ index c9758f3..c7ac766 100644
 +		r.ppcSize.store(func->ppcSize, std::memory_order_relaxed);
 +		r.x86Start.store((uintptr_t)func->x86Code, std::memory_order_release);
 +		s_cremaJitNext.fetch_add(1, std::memory_order_release);
++	}
++}
++
++// The profiler (port/ps4_sampler.cpp): the game function (its first guest address, 0: none) each
++// host address of recompiled code is in
++extern "C" void ps4_jit_guest_functions(const uint64* addresses, uint32* functions, int count)
++{
++	std::lock_guard _l(s_cremaJitMapLock);
++	if (!s_cremaJitMapSorted)
++	{
++		std::sort(s_cremaJitMap.begin(), s_cremaJitMap.end(), [](const CremaJitMapEntry& a, const CremaJitMapEntry& b) { return a.x86Start < b.x86Start; });
++		s_cremaJitMapSorted = true;
++	}
++	for (int i = 0; i < count; i++)
++	{
++		functions[i] = 0;
++		auto it = std::upper_bound(s_cremaJitMap.begin(), s_cremaJitMap.end(), addresses[i],
++			[](uint64 address, const CremaJitMapEntry& e) { return address < e.x86Start; });
++		if (it == s_cremaJitMap.begin())
++			continue;
++		--it;
++		if (addresses[i] < it->x86Start + it->x86Size)
++			functions[i] = it->ppcStart;
 +	}
 +}
 +
@@ -851,7 +984,7 @@ index c9758f3..c7ac766 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -174,6 +449,48 @@ void PPCRecompiler_attemptEnter(PPCInterpreter_t* hCPU, uint32 enterAddress)
+@@ -174,6 +491,48 @@ void PPCRecompiler_attemptEnter(PPCInterpreter_t* hCPU, uint32 enterAddress)
  }
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext);
  
@@ -900,7 +1033,7 @@ index c9758f3..c7ac766 100644
  PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PPCRange_t range, std::set<uint32>& entryAddresses, std::vector<std::pair<MPTR, uint32>>& entryPointsOut, PPCFunctionBoundaryTracker& boundaryTracker)
  {
  	if (range.startAddress >= PPC_REC_CODE_AREA_END)
-@@ -207,9 +524,21 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+@@ -207,9 +566,21 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
  	// generate intermediate code
  	ppcImlGenContext_t ppcImlGenContext = { 0 };
  	ppcImlGenContext.debug_entryPPCAddress = range.startAddress;
@@ -922,7 +1055,7 @@ index c9758f3..c7ac766 100644
  		delete ppcRecFunc;
  		return nullptr;
  	}
-@@ -232,10 +561,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+@@ -232,10 +603,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
  		delete ppcRecFunc;
  		return nullptr;
  	}
@@ -942,7 +1075,7 @@ index c9758f3..c7ac766 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +678,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +720,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -1085,7 +1218,7 @@ index c9758f3..c7ac766 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +825,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +867,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -1108,7 +1241,7 @@ index c9758f3..c7ac766 100644
  
  	return true;
  }
-@@ -377,6 +862,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +904,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -1117,7 +1250,7 @@ index c9758f3..c7ac766 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +875,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +917,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1134,7 +1267,7 @@ index c9758f3..c7ac766 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +914,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +956,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1144,7 +1277,7 @@ index c9758f3..c7ac766 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +941,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +983,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1266,7 +1399,7 @@ index c9758f3..c7ac766 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1084,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1126,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1350,7 +1483,7 @@ index c9758f3..c7ac766 100644
  	}
  }
  
-@@ -504,6 +1173,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1215,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1392,7 +1525,7 @@ index c9758f3..c7ac766 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1313,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1355,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1400,7 +1533,7 @@ index c9758f3..c7ac766 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1407,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1449,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1413,7 +1546,7 @@ index c9758f3..c7ac766 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1420,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1462,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -2869,10 +3002,10 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
-index bb31077..1403d8d 100644
+index bb31077..4568768 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
-@@ -11,10 +11,73 @@ CRITICAL_SECTION s_csSchedulerLock;
+@@ -11,10 +11,79 @@ CRITICAL_SECTION s_csSchedulerLock;
  pthread_mutex_t s_ptmSchedulerLock;
  #endif
  
@@ -2885,22 +3018,28 @@ index bb31077..1403d8d 100644
 +// the mutex was (per host thread; fibers lock and unlock on the same host thread).
 +#include <immintrin.h>
 +extern "C" int sceKernelUsleep(unsigned int microseconds);
-+static std::atomic<uint32> s_cremaSchedLocked{0};
-+static std::atomic<const void*> s_cremaSchedOwner{nullptr};
-+static uint32 s_cremaSchedDepth = 0;
++// The lock word, owner and depth on a cache line of their own: they move between the cores at
++// every handover, and a neighbouring global written elsewhere would make each one slower.
++struct alignas(64) CremaSchedLockState
++{
++	std::atomic<uint32> locked{0};
++	std::atomic<const void*> owner{nullptr};
++	uint32 depth = 0;
++};
++static CremaSchedLockState s_cremaSched;
 +thread_local char t_cremaSchedId;
 +
 +static void CremaSchedLock()
 +{
 +	const void* self = &t_cremaSchedId;
-+	if (s_cremaSchedOwner.load(std::memory_order_relaxed) == self)
++	if (s_cremaSched.owner.load(std::memory_order_relaxed) == self)
 +	{
-+		s_cremaSchedDepth++;
++		s_cremaSched.depth++;
 +		return;
 +	}
 +	for (uint32 n = 0;; n++)
 +	{
-+		if (s_cremaSchedLocked.load(std::memory_order_relaxed) == 0 && s_cremaSchedLocked.exchange(1, std::memory_order_acquire) == 0)
++		if (s_cremaSched.locked.load(std::memory_order_relaxed) == 0 && s_cremaSched.locked.exchange(1, std::memory_order_acquire) == 0)
 +			break;
 +		if (n < 4000)
 +			_mm_pause();
@@ -2909,31 +3048,31 @@ index bb31077..1403d8d 100644
 +		else
 +			sceKernelUsleep(20);
 +	}
-+	s_cremaSchedOwner.store(self, std::memory_order_relaxed);
-+	s_cremaSchedDepth = 1;
++	s_cremaSched.owner.store(self, std::memory_order_relaxed);
++	s_cremaSched.depth = 1;
 +}
 +
 +static bool CremaSchedTryLock()
 +{
 +	const void* self = &t_cremaSchedId;
-+	if (s_cremaSchedOwner.load(std::memory_order_relaxed) == self)
++	if (s_cremaSched.owner.load(std::memory_order_relaxed) == self)
 +	{
-+		s_cremaSchedDepth++;
++		s_cremaSched.depth++;
 +		return true;
 +	}
-+	if (s_cremaSchedLocked.load(std::memory_order_relaxed) != 0 || s_cremaSchedLocked.exchange(1, std::memory_order_acquire) != 0)
++	if (s_cremaSched.locked.load(std::memory_order_relaxed) != 0 || s_cremaSched.locked.exchange(1, std::memory_order_acquire) != 0)
 +		return false;
-+	s_cremaSchedOwner.store(self, std::memory_order_relaxed);
-+	s_cremaSchedDepth = 1;
++	s_cremaSched.owner.store(self, std::memory_order_relaxed);
++	s_cremaSched.depth = 1;
 +	return true;
 +}
 +
 +static void CremaSchedUnlock()
 +{
-+	if (--s_cremaSchedDepth != 0)
++	if (--s_cremaSched.depth != 0)
 +		return;
-+	s_cremaSchedOwner.store(nullptr, std::memory_order_relaxed);
-+	s_cremaSchedLocked.store(0, std::memory_order_release);
++	s_cremaSched.owner.store(nullptr, std::memory_order_relaxed);
++	s_cremaSched.locked.store(0, std::memory_order_release);
 +}
 +#endif
 +
@@ -2946,7 +3085,7 @@ index bb31077..1403d8d 100644
  #else
  	pthread_mutex_lock(&s_ptmSchedulerLock);
  #endif
-@@ -32,6 +95,8 @@ bool __OSTryLockScheduler(void* obj)
+@@ -32,6 +101,8 @@ bool __OSTryLockScheduler(void* obj)
  	bool r;
  #if BOOST_OS_WINDOWS
  	r = TryEnterCriticalSection(&s_csSchedulerLock);
@@ -2955,7 +3094,7 @@ index bb31077..1403d8d 100644
  #else
  	r = pthread_mutex_trylock(&s_ptmSchedulerLock) == 0;
  #endif
-@@ -49,6 +114,8 @@ void __OSUnlockScheduler(void* obj)
+@@ -49,6 +120,8 @@ void __OSUnlockScheduler(void* obj)
  	cemu_assert_debug(s_schedulerLockCount >= 0);
  #if BOOST_OS_WINDOWS
  	LeaveCriticalSection(&s_csSchedulerLock);
@@ -2965,7 +3104,7 @@ index bb31077..1403d8d 100644
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..09de7e5 100644
+index 9fe4bea..60ac45f 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2990,7 +3129,147 @@ index 9fe4bea..09de7e5 100644
  namespace coreinit
  {
  #ifdef __arm64__
-@@ -1180,6 +1188,9 @@ namespace coreinit
+@@ -68,7 +76,57 @@ namespace coreinit
+ 	SysAllocator<OSThreadQueue> g_activeThreadQueue; // list of all threads (can include non-detached inactive threads)
+ 
+ 	SysAllocator<OSThreadQueue, 3> g_coreRunQueue;
+-	CounterSemaphore g_coreRunQueueThreadCount[3];
++
++	// Each core's count of runnable threads. Every thread switch puts the outgoing thread back on
++	// its cores' queues and takes the next one off, inside the scheduler lock; as a CounterSemaphore
++	// each of those locked and unlocked a pthread mutex (~1.3% of the PS4's busiest emulated core,
++	// and a longer scheduler lock hold for the others). The count is atomic now: only a 0 -> 1
++	// change, which may have to wake a core sleeping in waitUntilNonZero(), takes the mutex.
++	class RunQueueThreadCount
++	{
++	public:
++		void increment()
++		{
++			if (m_count.fetch_add(1, std::memory_order_acq_rel) == 0)
++			{
++				// a waiter checks the count with the mutex held and releases it only inside wait(),
++				// so taking it here before notifying can't miss one
++				std::lock_guard lock(m_mutex);
++				m_condition.notify_all();
++			}
++		}
++
++		void decrement()
++		{
++			m_count.fetch_sub(1, std::memory_order_acq_rel);
++		}
++
++		bool isZero() const
++		{
++			return m_count.load(std::memory_order_acquire) == 0;
++		}
++
++		void waitUntilNonZero()
++		{
++			std::unique_lock lock(m_mutex);
++			while (isZero())
++				m_condition.wait(lock);
++		}
++
++	private:
++		std::atomic<sint64> m_count{0};
++		std::mutex m_mutex;
++		std::condition_variable m_condition;
++	};
++	RunQueueThreadCount g_coreRunQueueThreadCount[3];
++
++	// Checks on the thread switch path whose condition is a call into another file
++	// (__OSHasSchedulerLock): cemu_assert_debug evaluates its argument even in release builds.
++#ifdef CEMU_DEBUG_ASSERT
++#define OS_SCHED_ASSERT(__cond) cemu_assert_debug(__cond)
++#else
++#define OS_SCHED_ASSERT(__cond) do {} while (false)
++#endif
+ 
+ 	bool g_isMulticoreMode;
+ 
+@@ -93,6 +151,35 @@ namespace coreinit
+ 
+ 	std::unordered_map<OSThread_t*, OSHostThread*> s_threadToFiber;
+ 
++	// Every thread switch looks up the next thread's host thread. In s_threadToFiber that hashes
++	// the pointer (libc++: murmur2) and takes it modulo the bucket count, ~1% of the PS4's busiest
++	// emulated core. A direct-mapped cache in front of the map, filled on lookup and cleared when
++	// a host thread is deleted. Only used with the scheduler lock held.
++	struct HostThreadCacheEntry
++	{
++		OSThread_t* thread;
++		OSHostThread* hostThread;
++	};
++	HostThreadCacheEntry s_hostThreadCache[256]{};
++
++	HostThreadCacheEntry& __OSHostThreadCacheEntry(OSThread_t* thread)
++	{
++		// Fibonacci hashing of the guest address: OSThread_t are 0x6A0 bytes apart or more
++		const uint32 address = memory_getVirtualOffsetFromPointer(thread);
++		return s_hostThreadCache[(address * 2654435761u) >> 24];
++	}
++
++	OSHostThread* __OSGetHostThread(OSThread_t* thread)
++	{
++		HostThreadCacheEntry& entry = __OSHostThreadCacheEntry(thread);
++		if (entry.thread == thread)
++			return entry.hostThread;
++		auto it = s_threadToFiber.find(thread);
++		cemu_assert_debug(it != s_threadToFiber.end());
++		entry = { thread, it->second };
++		return it->second;
++	}
++
+ 	bool __CemuIsMulticoreMode()
+ 	{
+ 		return g_isMulticoreMode;
+@@ -126,6 +213,9 @@ namespace coreinit
+ 
+ 		auto hostThread = s_threadToFiber[thread];
+ 		s_threadToFiber.erase(thread);
++		HostThreadCacheEntry& cacheEntry = __OSHostThreadCacheEntry(thread);
++		if (cacheEntry.thread == thread)
++			cacheEntry = {};
+ 		_deleteQueue = hostThread;
+ 	}
+ 
+@@ -754,9 +844,9 @@ namespace coreinit
+ 	// adds the thread to each core's run queue if in runable state
+ 	void __OSAddReadyThreadToRunQueue(OSThread_t* thread)
+ 	{
+-        cemu_assert_debug(MMU_IsInPPCMemorySpace(thread));
+-        cemu_assert_debug(thread->IsValidMagic());
+-		cemu_assert_debug(__OSHasSchedulerLock());
++        OS_SCHED_ASSERT(MMU_IsInPPCMemorySpace(thread));
++        OS_SCHED_ASSERT(thread->IsValidMagic());
++		OS_SCHED_ASSERT(__OSHasSchedulerLock());
+ 
+ 		if (thread->state != OSThread_t::THREAD_STATE::STATE_READY)
+ 			return;
+@@ -777,7 +867,7 @@ namespace coreinit
+ 
+ 	void __OSRemoveThreadFromRunQueues(OSThread_t* thread)
+ 	{
+-		cemu_assert_debug(__OSHasSchedulerLock());
++		OS_SCHED_ASSERT(__OSHasSchedulerLock());
+ 		for (sint32 i = 0; i < PPC_CORE_COUNT; i++)
+ 		{
+ 			if(thread->currentRunQueue[i] == nullptr)
+@@ -1060,10 +1150,9 @@ namespace coreinit
+ 
+ 	void __OSSwitchToThreadFiber(OSThread_t* thread, uint32 coreIndex)
+ 	{
+-		cemu_assert_debug(__OSHasSchedulerLock());
+-		cemu_assert_debug(s_threadToFiber.find(thread) != s_threadToFiber.end());
++		OS_SCHED_ASSERT(__OSHasSchedulerLock());
+ 
+-		OSHostThread* hostThread = s_threadToFiber.find(thread)->second;
++		OSHostThread* hostThread = __OSGetHostThread(thread);
+ 		hostThread->selectedCore = coreIndex;
+ 		Fiber::Switch(hostThread->m_fiber);
+ 	}
+@@ -1180,6 +1269,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -3000,7 +3279,7 @@ index 9fe4bea..09de7e5 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1203,63 @@ namespace coreinit
+@@ -1192,9 +1284,66 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -3063,8 +3342,12 @@ index 9fe4bea..09de7e5 100644
 +
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
- 		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1278,9 @@ namespace coreinit
+-		cemu_assert_debug(__OSHasSchedulerLock());
++		OS_SCHED_ASSERT(__OSHasSchedulerLock());
+ 		// pick thread, then remove from run queue
+ 		OSThreadQueue* runQueue = g_coreRunQueue.GetPtr() + coreIndex;
+ 
+@@ -1210,6 +1359,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -3074,7 +3357,7 @@ index 9fe4bea..09de7e5 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1304,16 @@ namespace coreinit
+@@ -1233,6 +1385,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -3091,7 +3374,36 @@ index 9fe4bea..09de7e5 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1391,6 +1472,12 @@ namespace coreinit
+@@ -1281,7 +1443,7 @@ namespace coreinit
+ 
+ 	void __OSThreadSwitchToNext()
+ 	{
+-		cemu_assert_debug(__OSHasSchedulerLock());
++		OS_SCHED_ASSERT(__OSHasSchedulerLock());
+ 
+ 		OSHostThread* hostThread = (OSHostThread*)Fiber::GetFiberPrivateData();
+         cemu_assert_debug(hostThread);
+@@ -1291,7 +1453,7 @@ namespace coreinit
+ 
+ 		// store context of current thread
+ 		__OSStoreThread(OSGetCurrentThread(), &hostThread->ppcInstance);
+-		cemu_assert_debug(PPCInterpreter_getCurrentInstance() == nullptr);
++		OS_SCHED_ASSERT(PPCInterpreter_getCurrentInstance() == nullptr);
+ 
+ 		if (!sSchedulerActive.load(std::memory_order::relaxed))
+ 		{
+@@ -1327,8 +1489,8 @@ namespace coreinit
+ 			Fiber::Switch(*g_idleLoopFiber[t_assignedCoreIndex]);
+ 		}
+ 
+-		cemu_assert_debug(__OSHasSchedulerLock());	
+-		cemu_assert_debug(g_isMulticoreMode == false || hostThread->selectedCore == t_assignedCoreIndex);
++		OS_SCHED_ASSERT(__OSHasSchedulerLock());	
++		OS_SCHED_ASSERT(g_isMulticoreMode == false || hostThread->selectedCore == t_assignedCoreIndex);
+ 
+ 		// received next time slice, load self again
+ 		__OSLoadThread(hostThread->m_thread, &hostThread->ppcInstance, hostThread->selectedCore);
+@@ -1391,6 +1553,12 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -3104,7 +3416,16 @@ index 9fe4bea..09de7e5 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1734,159 @@ namespace coreinit
+@@ -1478,6 +1646,8 @@ namespace coreinit
+ 			delete hostThread;
+ 		}
+ 		s_threadToFiber.clear();
++		for (auto& entry : s_hostThreadCache)
++			entry = {};
+ 	}
+ 
+ 	bool OSIsSchedulerActive()
+@@ -1647,3 +1817,196 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
@@ -3118,6 +3439,10 @@ index 9fe4bea..09de7e5 100644
 +// a thread queue (events, semaphores, messages, sleeps, joins), with the calls it waits in most
 +// (the function the bl before the saved LR goes to). The PS4 side (samples.log) shows only where
 +// the host threads are; this shows why a game is slow when no host thread is busy.
++extern std::atomic<bool> g_crema_count_hle_calls; // BackendX64.cpp
++extern uint32 g_crema_hle_calls[4][0x4000];
++std::string PPCInterpreter_getHLEName(HLEIDX funcIndex); // PPCInterpreterHLE.cpp
++
 +namespace coreinit
 +{
 +	enum CensusKind : uint32 { kRunning, kReady, kMutex, kFastMutex, kQueue, kSuspended, kOther, kKinds };
@@ -3135,6 +3460,7 @@ index 9fe4bea..09de7e5 100644
 +
 +	void CremaThreadCensusSample()
 +	{
++		g_crema_count_hle_calls.store(true, std::memory_order_relaxed);
 +		OSThread_t* current[Espresso::CORE_COUNT];
 +		for (sint32 i = 0; i < Espresso::CORE_COUNT; i++)
 +			current[i] = __currentCoreThread[i];
@@ -3211,6 +3537,37 @@ index 9fe4bea..09de7e5 100644
 +	}
 +
 +	// one line per thread that ran or waited, busiest first, then the counters start over
++	// HLE calls from recompiled code per second since the last report: the total per core, then
++	// the busiest functions (BackendX64.cpp counts them while the census runs)
++	std::string CremaHleCallReport()
++	{
++		static auto s_last = std::chrono::steady_clock::now();
++		const auto now = std::chrono::steady_clock::now();
++		const double seconds = std::max(1e-3, std::chrono::duration<double>(now - s_last).count());
++		s_last = now;
++		uint64 perCore[3]{};
++		std::vector<std::pair<uint64, sint32>> functions;
++		for (sint32 id = 0; id < 0x4000; id++)
++		{
++			uint64 calls = 0;
++			for (sint32 core = 0; core < 3; core++)
++			{
++				const uint32 n = g_crema_hle_calls[core][id];
++				g_crema_hle_calls[core][id] = 0;
++				perCore[core] += n;
++				calls += n;
++			}
++			if (calls)
++				functions.emplace_back(calls, id);
++		}
++		std::sort(functions.begin(), functions.end(), std::greater<>());
++		std::string line = fmt::format("wiiu hle calls/s: core0 {}, core1 {}, core2 {} |", (uint64)(perCore[0] / seconds),
++			(uint64)(perCore[1] / seconds), (uint64)(perCore[2] / seconds));
++		for (size_t i = 0; i < functions.size() && i < 24; i++)
++			line += fmt::format(" {} {}", PPCInterpreter_getHLEName(functions[i].second), (uint64)(functions[i].first / seconds));
++		return line;
++	}
++
 +	std::vector<std::string> CremaThreadCensusReport()
 +	{
 +		static const char* kNames[kKinds] = {"run", "ready", "mutex", "fastmutex", "queue", "suspended", "other"};
@@ -3260,6 +3617,7 @@ index 9fe4bea..09de7e5 100644
 +			}
 +			lines.push_back(std::move(line));
 +		}
++		lines.push_back(CremaHleCallReport());
 +		return lines;
 +	}
 +}
@@ -14241,10 +14599,10 @@ index be10d40..f8b7d12 100644
  	target_sources(CemuUtil PRIVATE MemMapper/MemMapperUnix.cpp)
 diff --git a/src/util/Fiber/FiberPS4.cpp b/src/util/Fiber/FiberPS4.cpp
 new file mode 100644
-index 0000000..2eb99e4
+index 0000000..85c226d
 --- /dev/null
 +++ b/src/util/Fiber/FiberPS4.cpp
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,119 @@
 +// PS4: fibers by stack switching. The OpenOrbis C library (musl) has no ucontext functions, so
 +// the switch saves the callee-saved registers (System V x86-64) plus MXCSR and the x87 control
 +// word on the current stack and swaps stack pointers.
@@ -14347,13 +14705,17 @@ index 0000000..2eb99e4
 +	return sCurrentFiber;
 +}
 +
++// Compiler barriers only: both fibers run on this host thread, so program order already holds
++// for the CPU. A fiber resumed on another host thread is handed over through the scheduler lock
++// (acquire/release). The seq_cst thread fences of FiberUnix.cpp were an mfence on each side,
++// two per guest thread switch (four on the main core, which switches through its idle fiber).
 +void Fiber::Switch(Fiber& targetFiber)
 +{
 +	Fiber* leavingFiber = sCurrentFiber;
 +	sCurrentFiber = &targetFiber;
-+	std::atomic_thread_fence(std::memory_order_seq_cst);
++	std::atomic_signal_fence(std::memory_order_seq_cst);
 +	cemu_ps4_fiber_switch(&((FiberContext*)leavingFiber->m_implData)->sp, &((FiberContext*)targetFiber.m_implData)->sp);
-+	std::atomic_thread_fence(std::memory_order_seq_cst);
++	std::atomic_signal_fence(std::memory_order_seq_cst);
 +}
 +
 +void* Fiber::GetFiberPrivateData()

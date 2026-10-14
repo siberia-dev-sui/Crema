@@ -29,6 +29,10 @@
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" int pthread_getthreadid_np(void);  // libkernel (FreeBSD libthr)
 extern "C" void ps4_boot_trace(const char* stage);
+// The emulator's map from recompiled host code to the game function it came from (Crema:
+// PPCRecompiler.cpp): the game function's first guest address per host address, 0 if none.
+extern "C" __attribute__((weak)) void ps4_jit_guest_functions(const uint64_t* addresses,
+                                                              uint32_t* functions, int count);
 
 namespace {
 
@@ -90,6 +94,59 @@ void writeLine(int fd, const char* text) {
 
 void noteHotJit(uint64_t address, int count);
 
+// Recompiled code by game function ("jitfn": the function's first guest address). Its samples
+// are spread over thousands of 16-byte buckets, most of them seen once, so the bucket list misses
+// most of a busy core; summed per game function they show which of the game's code is hot.
+template <typename Entry>
+void reportJitByGuestFunction(int fd, const Entry* entries, int unique, int samples) {
+    if (!ps4_jit_guest_functions)
+        return;
+    static uint64_t addresses[kMaxSamples];
+    static uint32_t functions[kMaxSamples];
+    static int counts[kMaxSamples];
+    int m = 0, jit = 0;
+    for (int i = 0; i < unique; i++) {
+        if (entries[i].key >> 63) {
+            addresses[m] = entries[i].key & ~(1ULL << 63);
+            counts[m] = entries[i].count;
+            jit += entries[i].count;
+            m++;
+        }
+    }
+    if (m == 0)
+        return;
+    ps4_jit_guest_functions(addresses, functions, m);
+    // sum per function: sort (function, count) pairs by function, then merge
+    static uint64_t pairs[kMaxSamples];
+    for (int i = 0; i < m; i++)
+        pairs[i] = (static_cast<uint64_t>(functions[i]) << 32) | static_cast<uint32_t>(counts[i]);
+    std::sort(pairs, pairs + m);
+    int f = 0, unattributed = 0;
+    for (int i = 0; i < m;) {
+        const uint32_t function = static_cast<uint32_t>(pairs[i] >> 32);
+        int count = 0;
+        for (; i < m && static_cast<uint32_t>(pairs[i] >> 32) == function; i++)
+            count += static_cast<int>(pairs[i] & 0xFFFFFFFF);
+        if (function == 0)
+            unattributed += count;
+        else
+            pairs[f++] = (static_cast<uint64_t>(count) << 32) | function;
+    }
+    std::sort(pairs, pairs + f, [](uint64_t a, uint64_t b) { return a > b; });
+    char line[128];
+    snprintf(line, sizeof(line), "  jit %d samples, %d in %d game functions, %d outside them\n", jit,
+             jit - unattributed, f, unattributed);
+    writeLine(fd, line);
+    for (int i = 0; i < f && i < 80; i++) {
+        const int count = static_cast<int>(pairs[i] >> 32);
+        if (count < 2)
+            break;
+        snprintf(line, sizeof(line), "  %5.2f%% jitfn 0x%08x\n", 100.0 * count / samples,
+                 static_cast<uint32_t>(pairs[i] & 0xFFFFFFFF));
+        writeLine(fd, line);
+    }
+}
+
 // Aggregates one thread's window: sorts the samples in place and prints the top entries.
 void report(int fd, ThreadSamples& t, double window_start) {
     // Copy first: the handler keeps writing into t.samples once count is reset.
@@ -149,6 +206,7 @@ void report(int fd, ThreadSamples& t, double window_start) {
                      static_cast<unsigned long long>(entries[i].key));
         writeLine(fd, line);
     }
+    reportJitByGuestFunction(fd, entries, unique, n);
 }
 
 // 64 KiB chunks of JIT code sampled since the last dump (dumpJitCode).
