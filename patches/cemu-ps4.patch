@@ -1429,7 +1429,7 @@ index c9758f3..b9a8b9c 100644
      while(!s_ppcRecompilerState.targetQueue.empty())
          s_ppcRecompilerState.targetQueue.pop();
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..1735093 100644
+index 89e805d..e4ba884 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -1528,6 +1528,30 @@ index 89e805d..1735093 100644
  
  		PPCRecompiler_pushBackIMLInstructions(seg, 0, 1);
  		seg->imlList[0].type = PPCREC_IML_TYPE_MACRO;
+@@ -3197,6 +3227,23 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+ 		ppcImlGenContext.currentBasicBlock = nullptr;
+ 	}
+ 
++	// Crema (Cycle Counting: Fast): a block whose instructions emit no IML (a lone b, a nop) got no
++	// count either, and the passes after this were never written for an empty segment (that froze
++	// and crashed Tekken Tag Tournament 2 in 1.63-1.65). Only now is it known which blocks are
++	// empty, so each of them counts one cycle.
++	if (g_crema_fast_cycles)
++	{
++		for (IMLSegment* seg : ppcImlGenContext.segmentList2)
++		{
++			if (!seg->imlList.empty())
++				continue;
++			PPCRecompiler_pushBackIMLInstructions(seg, 0, 1);
++			seg->imlList[0].type = PPCREC_IML_TYPE_MACRO;
++			seg->imlList[0].operation = PPCREC_IML_MACRO_COUNT_CYCLES;
++			seg->imlList[0].op_macro.param = 1;
++		}
++	}
++
+ 	// mark segments with unknown jump destination (e.g. BLR and most macros)
+ 	PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext);
+ 
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..24b109b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -8133,10 +8157,10 @@ index 0000000..b972bf8
 +} // namespace CremaGraphicPacks
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..0836d8b
+index 0000000..cd90ca6
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,406 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -8489,6 +8513,16 @@ index 0000000..0836d8b
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
++	// Crema experiment, measured without a menu entry: /data/Crema/fast_cycles.txt holding "1" turns
++	// on Cycle Counting Fast (PPCRecompilerImlGen.cpp)
++	g_crema_fast_cycles = false;
++	if (FILE* file = fopen("/data/Crema/fast_cycles.txt", "rb"))
++	{
++		g_crema_fast_cycles = fgetc(file) == '1';
++		fclose(file);
++	}
++	if (g_crema_fast_cycles)
++		cemuLog_log(LogType::Force, "Crema experiment: Cycle Counting Fast (/data/Crema/fast_cycles.txt)");
 +	g_crema_fast_compares = get("compare_results") != "exact";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
