@@ -372,6 +372,19 @@ void createThreadDtorKey() { pthread_key_create(&g_threadDtorKey, runThreadDtors
 
 }  // namespace
 
+extern "C" size_t ps4_heap_top(void* msp);  // ps4_dlmalloc.c
+
+// Heap statistics for Crema Live (gui/ps4/CremaLive.cpp): size and grown part (size minus the
+// unused top) of the main heap and of the overflow heap, in bytes.
+extern "C" void ps4_heap_usage(uint64_t* main_size, uint64_t* main_grown, uint64_t* overflow_size,
+                               uint64_t* overflow_grown) {
+    *main_size = g_heapSize;
+    *main_grown = g_heap ? g_heapSize - ps4_heap_top(g_heap) : 0;
+    mspace overflow = __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);
+    *overflow_size = overflow ? g_overflowSize : 0;
+    *overflow_grown = overflow ? g_overflowSize - ps4_heap_top(overflow) : 0;
+}
+
 extern "C" {
 
 // dlmalloc found a corrupted heap (corruption = 1) or was asked to free/realloc something it

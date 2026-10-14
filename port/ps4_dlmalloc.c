@@ -37,3 +37,10 @@ int ps4_heap_ok(void* msp) {
   mstate ms = (mstate)msp;
   return ok_magic(ms);
 }
+
+/* Free space at the top of the mspace (never used, or given back by frees at its end): the heap
+ * size minus this is how far the heap has grown. Read without the lock: a statistic (Crema Live). */
+size_t ps4_heap_top(void* msp) {
+  mstate ms = (mstate)msp;
+  return ms->topsize;
+}

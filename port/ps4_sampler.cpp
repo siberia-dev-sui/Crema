@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" int pthread_getthreadid_np(void);  // libkernel (FreeBSD libthr)
@@ -94,6 +95,26 @@ void writeLine(int fd, const char* text) {
 
 void noteHotJit(uint64_t address, int count);
 
+// Samples per game function since Crema Live last read them (ps4_sampler_hot): an open-addressing
+// table filled by the sampler thread, read and cleared by the Crema Live thread.
+constexpr int kHotFunctions = 8192;
+struct HotFunction { uint32_t function; uint32_t samples; };
+HotFunction g_hot_functions[kHotFunctions];
+std::mutex g_hot_functions_lock;
+
+void noteHotFunction(uint32_t function, uint32_t samples) {
+    std::lock_guard<std::mutex> lock(g_hot_functions_lock);
+    uint32_t slot = (function * 2654435761u) % kHotFunctions;
+    for (int probe = 0; probe < 64; probe++, slot = (slot + 1) % kHotFunctions) {
+        HotFunction& h = g_hot_functions[slot];
+        if (h.function == function || h.function == 0) {
+            h.function = function;
+            h.samples += samples;
+            return;
+        }
+    }
+}
+
 // Recompiled code by game function ("jitfn": the function's first guest address). Its samples
 // are spread over thousands of 16-byte buckets, most of them seen once, so the bucket list misses
 // most of a busy core; summed per game function they show which of the game's code is hot.
@@ -129,8 +150,10 @@ void reportJitByGuestFunction(int fd, const Entry* entries, int unique, int samp
             count += static_cast<int>(pairs[i] & 0xFFFFFFFF);
         if (function == 0)
             unattributed += count;
-        else
+        else {
             pairs[f++] = (static_cast<uint64_t>(count) << 32) | function;
+            noteHotFunction(function, static_cast<uint32_t>(count));
+        }
     }
     std::sort(pairs, pairs + f, [](uint64_t a, uint64_t b) { return a > b; });
     char line[128];
@@ -765,4 +788,50 @@ extern "C" void ps4_sampler_set_enabled(int on) {
         ps4_sampler_start();
     else if (g_sampler_on.exchange(false))
         ps4_boot_trace("sampler: paused");
+}
+
+// Crema Live (gui/ps4/CremaLive.cpp): the busiest game functions since the last call (samples,
+// all sampled threads), busiest first; clears the table when reset is set. Needs the profiler on.
+extern "C" int ps4_sampler_hot(uint32_t* functions, uint32_t* samples, int max, int reset) {
+    std::lock_guard<std::mutex> lock(g_hot_functions_lock);
+    int found = 0;
+    for (int i = 0; i < kHotFunctions; i++) {
+        const HotFunction h = g_hot_functions[i];
+        if (h.function == 0)
+            continue;
+        // insertion into the top `max`, busiest first
+        int at = found < max ? found : max;
+        while (at > 0 && samples[at - 1] < h.samples) {
+            if (at < max) {
+                functions[at] = functions[at - 1];
+                samples[at] = samples[at - 1];
+            }
+            at--;
+        }
+        if (at < max) {
+            functions[at] = h.function;
+            samples[at] = h.samples;
+            if (found < max)
+                found++;
+        }
+    }
+    if (reset)
+        memset(g_hot_functions, 0, sizeof(g_hot_functions));
+    return found;
+}
+
+// Crema Live: each watched thread that reports its own CPU time (ps4_thread_cpu_tick), with that
+// time in ns; the caller takes differences. Returns how many were written.
+extern "C" int ps4_thread_cpu_snapshot(const char** names, uint64_t* ns, int max) {
+    int n = 0;
+    const int count = std::min(g_watched_count.load(std::memory_order_acquire), kMaxWatched);
+    for (int i = 0; i < count && n < max; i++) {
+        const uint64_t t = g_watched_cpu_ns[i].load(std::memory_order_relaxed);
+        if (t == 0)
+            continue;
+        names[n] = g_watched[i].name;
+        ns[n] = t;
+        n++;
+    }
+    return n;
 }
