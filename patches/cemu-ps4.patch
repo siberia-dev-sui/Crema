@@ -1567,6 +1567,70 @@ index de67772..24b109b 100644
  		uint32 itHeader = LatteCP_readU32Deprc();
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
+diff --git a/src/Cafe/HW/Latte/Core/LatteOverlay.cpp b/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
+index 8fdc8f3..e89fd61 100644
+--- a/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
+@@ -68,6 +68,40 @@ struct OverlayList
+ const auto kPopupFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+ 
+ const float kBackgroundAlpha = 0.65f;
++
++// Crema (Display > Live Log): the log's newest lines in a window at the bottom left, under the
++// settings that matter for speed (g_crema_overlay_header, set by CremaSettings.cpp at game start)
++bool g_crema_live_log = false;
++std::string g_crema_overlay_header;
++
++static void LatteOverlay_RenderLiveLog(const Vector2f& window_size, float fontSize)
++{
++	constexpr size_t kLines = 8;
++	constexpr size_t kLineLength = 110;
++	const auto font = ImGui_GetFont(fontSize);
++	if (!font)
++		return;
++	// the newest lines, without the controllers' motion readings (one every 10 s)
++	const std::vector<std::string> lines = cemuLog_recentLines();
++	std::vector<std::string_view> shown;
++	for (auto it = lines.rbegin(); it != lines.rend() && shown.size() < kLines; ++it)
++	{
++		if (it->find("PS4Pad: motion") == std::string::npos)
++			shown.emplace_back(std::string_view(*it).substr(0, kLineLength));
++	}
++	ImGui::PushFont(font);
++	ImGui::SetNextWindowPos({fontSize, window_size.y - fontSize}, ImGuiCond_Always, {0.0f, 1.0f});
++	ImGui::SetNextWindowBgAlpha(kBackgroundAlpha);
++	if (ImGui::Begin("Live log", nullptr, kPopupFlags))
++	{
++		if (!g_crema_overlay_header.empty())
++			ImGui::TextColored({1.0f, 0.8f, 0.3f, 1.0f}, "%s", g_crema_overlay_header.c_str());
++		for (auto it = shown.rbegin(); it != shown.rend(); ++it)
++			ImGui::TextUnformatted(it->data(), it->data() + it->size());
++	}
++	ImGui::End();
++	ImGui::PopFont();
++}
+ void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 direction, float fontSize, bool pad)
+ {
+ 	auto& config = GetConfig();
+@@ -517,7 +551,7 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
+ void LatteOverlay_render(bool pad_view)
+ {
+ 	const auto& config = GetConfig();
+-	if(config.overlay.position == ScreenPosition::kDisabled && config.notification.position == ScreenPosition::kDisabled)
++	if(config.overlay.position == ScreenPosition::kDisabled && config.notification.position == ScreenPosition::kDisabled && !g_crema_live_log)
+ 		return;
+ 
+ 	sint32 w = 0, h = 0;
+@@ -561,6 +595,9 @@ void LatteOverlay_render(bool pad_view)
+ 
+ 		LatteOverlay_RenderNotifications(position, pivot, direction, notificationsFontSize, pad_view);
+ 	}
++
++	if (g_crema_live_log && !pad_view)
++		LatteOverlay_RenderLiveLog(window_size, 18.0f * fontDPIScale);
+ }
+ 
+ void LatteOverlay_init()
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 index a3bcb63..e628db6 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
@@ -3176,6 +3240,57 @@ index 6cb1599..3b5a3cc 100644
  		// if we haven't buffered any blocks, we will wait less time than usual
  		bool additional_blocks_required = false;
  		{
+diff --git a/src/Cemu/Logging/CemuLogging.cpp b/src/Cemu/Logging/CemuLogging.cpp
+index f2d9ac0..8ad1cd1 100644
+--- a/src/Cemu/Logging/CemuLogging.cpp
++++ b/src/Cemu/Logging/CemuLogging.cpp
+@@ -8,6 +8,7 @@
+ #include <mutex>
+ #include <condition_variable>
+ #include <chrono>
++#include <deque>
+ 
+ #include <fmt/printf.h>
+ 
+@@ -173,9 +174,25 @@ void cemuLog_createLogFile(bool triggeredByCrash)
+ 	lock.unlock();
+ }
+ 
++// Crema: the last lines, for the in-game live log (guarded by LogContext.log_mutex)
++static std::deque<std::string> s_recentLines;
++constexpr size_t kRecentLines = 24;
++
++std::vector<std::string> cemuLog_recentLines()
++{
++	std::unique_lock lock(LogContext.log_mutex);
++	return {s_recentLines.begin(), s_recentLines.end()};
++}
++
+ void cemuLog_writeLineToLog(std::string_view text, bool date, bool new_line)
+ {
+ 	std::unique_lock lock(LogContext.log_mutex);
++	if (new_line)
++	{
++		s_recentLines.emplace_back(text);
++		if (s_recentLines.size() > kRecentLines)
++			s_recentLines.pop_front();
++	}
+ 
+ 	if (date)
+ 	{
+diff --git a/src/Cemu/Logging/CemuLogging.h b/src/Cemu/Logging/CemuLogging.h
+index 6a23d90..cca37ca 100644
+--- a/src/Cemu/Logging/CemuLogging.h
++++ b/src/Cemu/Logging/CemuLogging.h
+@@ -61,6 +61,8 @@ struct fmt::formatter<std::u8string_view> : formatter<string_view> {
+ };
+ 
+ void cemuLog_writeLineToLog(std::string_view text, bool date = true, bool new_line = true);
++// Crema: the last lines written to the log, oldest first (the in-game live log, LatteOverlay.cpp)
++std::vector<std::string> cemuLog_recentLines();
+ inline void cemuLog_writePlainToLog(std::string_view text) { cemuLog_writeLineToLog(text, false, false); }
+ 
+ void cemuLog_setActiveLoggingFlags(uint64 flagMask);
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 index 7afbf19..bee0598 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
@@ -5369,10 +5484,10 @@ index 0000000..e00d2d5
 +} // namespace CremaOnline
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 0000000..d45f6c5
+index 0000000..35021dd
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,1059 @@
+@@ -0,0 +1,1064 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -6005,7 +6120,8 @@ index 0000000..d45f6c5
 +		case ROW_MOTION: return MotionOn() ? "On" : "Off";
 +		case ROW_CONTROLS: return HasGameLayout(0) ? "This Game" : "All Games";
 +		case ROW_VOLUME: return std::to_string(Volume());
-+		case ROW_FPS: return GetConfig().overlay.position != ScreenPosition::kDisabled ? "On" : "Off";
++		case ROW_FPS:
++			return GetConfig().overlay.position == ScreenPosition::kDisabled ? "Off" : GetConfig().overlay.text_scale > 100 ? "Large" : "On";
 +		default: return {};
 +		}
 +	}
@@ -6080,10 +6196,14 @@ index 0000000..d45f6c5
 +		}
 +		case ROW_FPS:
 +		{
++			// Off, On, Large (and back): left goes the other way
 +			auto& overlay = GetConfig().overlay;
-+			overlay.position = overlay.position == ScreenPosition::kDisabled ? ScreenPosition::kTopLeft : ScreenPosition::kDisabled;
++			const int current = overlay.position == ScreenPosition::kDisabled ? 0 : overlay.text_scale > 100 ? 2 : 1;
++			const int next = (current + (direction < 0 ? 2 : 1)) % 3;
++			overlay.position = next == 0 ? ScreenPosition::kDisabled : ScreenPosition::kTopLeft;
++			overlay.text_scale = next == 2 ? 300 : 100;
 +			overlay.fps = true;
-+			Save("show_fps", overlay.position != ScreenPosition::kDisabled ? "on" : "off");
++			Save("show_fps", next == 0 ? "off" : next == 1 ? "on" : "large");
 +			break;
 +		}
 +		case ROW_RESTART:
@@ -8133,10 +8253,10 @@ index 0000000..b972bf8
 +} // namespace CremaGraphicPacks
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..0836d8b
+index 0000000..725af7a
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,418 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -8147,6 +8267,9 @@ index 0000000..0836d8b
 +#include "config/NetworkSettings.h"
 +
 +extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
++// Cafe/HW/Latte/Core/LatteOverlay.cpp: Display > Live Log
++extern bool g_crema_live_log;
++extern std::string g_crema_overlay_header;
 +extern bool g_crema_fast_cycles; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Cycle Counting
 +extern bool g_crema_fast_compares; // Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp: Compare Results
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
@@ -8171,8 +8294,10 @@ index 0000000..0836d8b
 +			"What the TV shows when a game starts: the game's TV picture, or its GamePad screen (the pause menu swaps them)."},
 +		{"touch_pointer", "Touch Pointer", "Display", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"A pointer where your finger is on the touchpad, so you can see where a touch lands."},
-+		{"show_fps", "FPS Counter", "Display", {{"off", "Off"}, {"on", "On"}}, "off", false,
-+			"Frames per second in the top left corner."},
++		{"show_fps", "FPS Counter", "Display", {{"off", "Off"}, {"on", "On"}, {"large", "Large"}}, "off", false,
++			"Frames per second in the top left corner. Large: three times the size, readable on a TV and in videos."},
++		{"live_log", "Live Log", "Display", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"The log's newest lines at the bottom left while a game runs, under this game's speed settings and Crema's version."},
 +		{"vsync", "VSync", "Display", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: each new picture waits for the TV's next refresh, so it never tears (a line where two pictures meet), but a frame can wait up to 16 ms. Off: pictures show at once (Cemu's VSync off)."},
 +		{"scaling", "Picture Size", "Display", {{"keep", "Keep Aspect Ratio"}, {"stretch", "Stretch"}},
@@ -8498,8 +8623,25 @@ index 0000000..0836d8b
 +	config.upscale_filter = upscale == "linear" ? kLinearFilter : upscale == "hermite" ? kBicubicHermiteFilter :
 +		upscale == "nearest" ? kNearestNeighborFilter : kBicubicFilter;
 +	config.fullscreen_scaling = get("scaling") == "stretch" ? kStretch : kKeepAspectRatio;
-+	config.overlay.position = get("show_fps") == "on" ? ScreenPosition::kTopLeft : ScreenPosition::kDisabled;
++	const std::string fps = get("show_fps");
++	config.overlay.position = fps != "off" ? ScreenPosition::kTopLeft : ScreenPosition::kDisabled;
 +	config.overlay.fps = true;
++	config.overlay.text_scale = fps == "large" ? 300 : 100;
++	g_crema_live_log = get("live_log") == "on";
++	{
++		std::string version;
++		if (FILE* file = fopen("/app0/version.txt", "rb"))
++		{
++			char line[32] = {};
++			if (fgets(line, sizeof(line), file))
++				version = line;
++			fclose(file);
++		}
++		while (!version.empty() && (version.back() == '\n' || version.back() == '\r'))
++			version.pop_back();
++		g_crema_overlay_header = fmt::format("Crema {} | Quantum {} | Graphics {} | Fast Shifts {} | Compare {}",
++			version, get("thread_quantum"), get("gpu_accuracy"), get("cl_shifts"), get("compare_results"));
++	}
 +
 +	static const std::map<std::string, CafeConsoleLanguage> LANGUAGES = {
 +		{"ja", CafeConsoleLanguage::JA}, {"en", CafeConsoleLanguage::EN}, {"fr", CafeConsoleLanguage::FR},
