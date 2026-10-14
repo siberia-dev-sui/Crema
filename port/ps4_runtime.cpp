@@ -864,10 +864,34 @@ struct ThreadStart {
     void* arg;
 };
 
+// Which cores the emulation's threads keep to, for measuring (/data/Crema/affinity.txt, one digit,
+// read once; without the file: 1).
+//   0: every thread on all of the app's cores (as before)
+//   1: the emulated CPU cores and the GPU thread on cluster 0, the recompiler's workers on cluster 1
+//   2: as 1, and every other new thread on cluster 1 too
+//   3: as 2, and each emulated CPU core and the GPU thread on a core of its own in cluster 0
+int affinityMode() {
+    static const int mode = [] {
+        int m = 1;
+        if (FILE* file = fopen("/data/Crema/affinity.txt", "rb")) {
+            const int c = fgetc(file);
+            if (c >= '0' && c <= '3')
+                m = c - '0';
+            fclose(file);
+        }
+        return m;
+    }();
+    return mode;
+}
+
+constexpr uint64_t kEmulationCluster = 0x0F & kAppCores;
+constexpr uint64_t kHelperCluster = 0xF0 & kAppCores;
+
 void* startOnAppCores(void* raw) {
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
-    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kAppCores);
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(),
+                                                             affinityMode() >= 2 ? kHelperCluster : kAppCores);
     ps4_install_signal_stack();
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name
@@ -888,11 +912,18 @@ extern "C" void ps4_boost_thread() {
 // data written on one cluster and read on the other crosses between the L2s. The emulated CPU
 // cores and the GPU thread share the most data (guest memory, the command buffer), so they keep
 // to cluster 0; the recompiler's workers go to the other cluster, out of their L2.
-extern "C" void ps4_keep_to_emulation_cluster() {
-    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 0x0F & kAppCores);
+// slot: the emulated CPU core (0-2), or 3 for the GPU thread.
+extern "C" void ps4_keep_to_emulation_cluster(int slot) {
+    const int mode = affinityMode();
+    if (mode == 0)
+        return;
+    const uint64_t mask = mode == 3 ? (uint64_t{1} << (slot & 3)) & kEmulationCluster : kEmulationCluster;
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), mask);
 }
 extern "C" void ps4_keep_to_helper_cluster() {
-    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 0xF0 & kAppCores);
+    if (affinityMode() == 0)
+        return;
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kHelperCluster);
 }
 
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
@@ -915,10 +946,11 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
     if (!s_logged.exchange(true)) {
         uint64_t mask = 0;
         reinterpret_cast<GetAffinityFn>(&scePthreadGetaffinity)(scePthreadSelf(), &mask);
-        char line[160];
+        char line[200];
         snprintf(line, sizeof(line),
-                 "threads: first creator's cores %#llx, new threads get %#llx; stack %zu KiB by default, at least %zu KiB",
-                 static_cast<unsigned long long>(mask), static_cast<unsigned long long>(kAppCores), stack / 1024,
+                 "threads: first creator's cores %#llx, new threads get %#llx (affinity mode %d); stack %zu KiB by default, at least %zu KiB",
+                 static_cast<unsigned long long>(mask),
+                 static_cast<unsigned long long>(affinityMode() >= 2 ? kHelperCluster : kAppCores), affinityMode(), stack / 1024,
                  kMinThreadStack / 1024);
         ps4_boot_trace(line);
     }

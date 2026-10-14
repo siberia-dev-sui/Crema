@@ -1712,7 +1712,7 @@ index f1556f8..1cc9d33 100644
  }
  
 diff --git a/src/Cafe/HW/Latte/Core/LatteThread.cpp b/src/Cafe/HW/Latte/Core/LatteThread.cpp
-index 743ab67..a707228 100644
+index 743ab67..bc6b5cd 100644
 --- a/src/Cafe/HW/Latte/Core/LatteThread.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteThread.cpp
 @@ -18,6 +18,11 @@
@@ -1722,7 +1722,7 @@ index 743ab67..a707228 100644
 +#if defined(__ORBIS__)
 +extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
-+extern "C" void ps4_keep_to_emulation_cluster(); // port/ps4_runtime.cpp: cores 0-3, one L2
++extern "C" void ps4_keep_to_emulation_cluster(int slot); // port/ps4_runtime.cpp: cores 0-3, one L2
 +#endif
  
  LatteGPUState_t LatteGPUState = {};
@@ -1734,7 +1734,7 @@ index 743ab67..a707228 100644
 +#if defined(__ORBIS__)
 +	ps4_sampler_register_thread("LatteThread");
 +	ps4_boost_thread();
-+	ps4_keep_to_emulation_cluster();
++	ps4_keep_to_emulation_cluster(3); // after the three emulated CPU cores
 +#endif
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
@@ -2812,7 +2812,7 @@ index bb31077..1403d8d 100644
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..abfac1f 100644
+index 9fe4bea..09de7e5 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2832,7 +2832,7 @@ index 9fe4bea..abfac1f 100644
 +extern "C" void ps4_thread_cpu_tick(); // port/ps4_sampler.cpp
 +extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
-+extern "C" void ps4_keep_to_emulation_cluster(); // port/ps4_runtime.cpp: cores 0-3, one L2
++extern "C" void ps4_keep_to_emulation_cluster(int slot); // port/ps4_runtime.cpp: cores 0-3, one L2
 +#endif
  namespace coreinit
  {
@@ -2946,7 +2946,7 @@ index 9fe4bea..abfac1f 100644
 +		static const char* const kProfiledNames[] = {"OSSched[core=0]", "OSSched[core=1]", "OSSched[core=2]"};
 +		ps4_sampler_register_thread(kProfiledNames[std::min<uintptr_t>((uintptr_t)_assignedCoreIndex, 2)]);
 +		ps4_boost_thread();
-+		ps4_keep_to_emulation_cluster();
++		ps4_keep_to_emulation_cluster((int)(uintptr_t)_assignedCoreIndex);
 +#endif
  
  		ConfigureHostFloatingPointEnvironment();
