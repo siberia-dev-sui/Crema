@@ -3907,10 +3907,10 @@ index f503c10..fd4754d 100644
  VKFUNC_DEVICE(vkCreateSampler);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
 new file mode 100644
-index 0000000..8a89abb
+index 0000000..a154ac7
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,599 @@
 +// Crema: frame generation on the PS4 (/data/Crema/framegen.txt holding "1", Crema Live: set framegen 0/1).
 +// BotW is held back by the emulated Wii U cores (~24 FPS) while the PS4's GPU is mostly idle, so
 +// the GPU draws an in-between frame for every game frame, like the motion interpolation of a TV:
@@ -3928,6 +3928,8 @@ index 0000000..8a89abb
 +
 +std::atomic<bool> g_crema_framegen{false};
 +std::atomic<uint64_t> g_crema_framegen_frames{0};
++// Crema Live: set fg_<name> value (VulkanFrameGenPS4.h)
++std::atomic<float> g_crema_fg_params[kCremaFgParamCount] = {0.12f, 0.35f, 0.04f, 0.0f, 5.0f, 0.01f, 0.004f};
 +
 +namespace
 +{
@@ -4053,21 +4055,33 @@ index 0000000..8a89abb
 +}
 +)";
 +
-+	// both frames moved halfway along the vector; where they disagree, the newer one
++	// both frames moved halfway along the vector; where they disagree, the newer one; pixels that
++	// didn't change between the frames (the HUD, the panel, a still background) stay as they are,
++	// so vectors of a moving background around them can't drag them along.
++	// a.xy: disagreement range, a.z: largest change of a still pixel, a.w: 1 shows the vectors
 +	const char* kInterpShader = R"(#version 450
 +layout(location = 0) in vec2 uv;
 +layout(location = 0) out vec4 outColor;
 +layout(set = 0, binding = 0) uniform sampler2D prevColor;
 +layout(set = 0, binding = 1) uniform sampler2D currColor;
 +layout(set = 0, binding = 2) uniform sampler2D flow;
++layout(push_constant) uniform Params { vec4 a; vec4 b; } pc;
++float MaxOf(vec3 v) { return max(v.r, max(v.g, v.b)); }
 +void main()
 +{
 +	vec2 d = texture(flow, uv).xy;
++	if (pc.a.w > 0.5)
++	{
++		outColor = vec4(0.5 + d * 8.0, 0.5, 1.0);
++		return;
++	}
 +	vec3 a = texture(prevColor, uv - 0.5 * d).rgb;
 +	vec3 b = texture(currColor, uv + 0.5 * d).rgb;
-+	vec3 diff = abs(a - b);
-+	float w = smoothstep(0.12, 0.35, max(diff.r, max(diff.g, diff.b)));
-+	outColor = vec4(mix(0.5 * (a + b), b, w), 1.0);
++	vec3 moved = mix(0.5 * (a + b), b, smoothstep(pc.a.x, pc.a.y, MaxOf(abs(a - b))));
++	vec3 p0 = texture(prevColor, uv).rgb;
++	vec3 c0 = texture(currColor, uv).rgb;
++	float still = 1.0 - smoothstep(pc.a.z * 0.5, pc.a.z, MaxOf(abs(p0 - c0)));
++	outColor = vec4(mix(moved, c0, still), 1.0);
 +}
 +)";
 +
@@ -4447,8 +4461,10 @@ index 0000000..8a89abb
 +		const VkExtent2D e = m_flow[l].extent;
 +		const bool coarsest = l == kLevels - 1;
 +		const VkExtent2D c = coarsest ? e : m_flow[l + 1].extent;
-+		float params[8] = {1.0f / e.width, 1.0f / e.height, coarsest ? 5.0f : 1.0f, coarsest ? 0.0f : 1.0f,
-+			1.0f / c.width, 1.0f / c.height, coarsest ? 0.01f : 0.004f, 0.0f};
++		const float radius = std::clamp(g_crema_fg_params[kFgRadius].load(), 1.0f, 12.0f);
++		const float penalty = (coarsest ? g_crema_fg_params[kFgPenaltyCoarse] : g_crema_fg_params[kFgPenaltyFine]).load();
++		float params[8] = {1.0f / e.width, 1.0f / e.height, coarsest ? radius : 1.0f, coarsest ? 0.0f : 1.0f,
++			1.0f / c.width, 1.0f / c.height, penalty, 0.0f};
 +		Pass(cmd, m_pipeFlow, m_passFlow, m_flow[l].framebuffer, e, m_setFlow[p][l], params);
 +	}
 +	return true;
@@ -4466,7 +4482,9 @@ index 0000000..8a89abb
 +	}
 +	if (!m_pipeInterp)
 +		return;
-+	Pass(cmd, m_pipeInterp, renderPass, framebuffer, m_screen, m_setInterp[m_parity], nullptr);
++	float params[8] = {g_crema_fg_params[kFgDisagreeLow].load(), g_crema_fg_params[kFgDisagreeHigh].load(),
++		g_crema_fg_params[kFgStill].load(), g_crema_fg_params[kFgShowVectors].load()};
++	Pass(cmd, m_pipeInterp, renderPass, framebuffer, m_screen, m_setInterp[m_parity], params);
 +}
 +
 +void CremaFrameGen::CopyCurrentTo(VkCommandBuffer cmd, VkImage swapchainImage)
@@ -4494,10 +4512,10 @@ index 0000000..8a89abb
 +}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h
 new file mode 100644
-index 0000000..c373582
+index 0000000..158a721
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,82 @@
 +#pragma once
 +// Crema: frame generation on the PS4 (VulkanFrameGenPS4.cpp)
 +#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
@@ -4506,6 +4524,20 @@ index 0000000..c373582
 +
 +extern std::atomic<bool> g_crema_framegen; // framegen.txt, Crema Live: set framegen 0/1
 +extern std::atomic<uint64_t> g_crema_framegen_frames; // in-between frames presented
++// tunable live (Crema Live: set fg_<name> value)
++enum CremaFgParam
++{
++	kFgDisagreeLow, // where the two moved frames start to disagree (0-1): lean on the newer one from here
++	kFgDisagreeHigh, // fully the newer one
++	kFgStill, // a pixel that changed less than this between the frames is still (HUD, panel)
++	kFgShowVectors, // 1: draw the motion vectors instead of the in-between frame
++	kFgRadius, // full search radius at the coarsest level, in its texels (1/32 of the screen)
++	kFgPenaltyCoarse, // cost per texel of motion: keeps flat areas still
++	kFgPenaltyFine,
++	kCremaFgParamCount
++};
++extern std::atomic<float> g_crema_fg_params[kCremaFgParamCount];
++static_assert(kCremaFgParamCount == 7, "gui/ps4/CremaLive.cpp names the fg_ settings in this order");
 +
 +class CremaFrameGen
 +{
@@ -7606,10 +7638,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..5a8739a
+index 0000000..1fbe2c5
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,549 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -7673,6 +7705,8 @@ index 0000000..5a8739a
 +extern std::atomic<uint64_t> g_crema_presents; // HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 +extern std::atomic<uint64_t> g_crema_game_frames; // HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +extern std::atomic<bool> g_crema_framegen; // HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
++constexpr int kCremaFgParamCount = 7; // VulkanFrameGenPS4.h: CremaFgParam, in this order
++extern std::atomic<float> g_crema_fg_params[kCremaFgParamCount];
 +namespace coreinit
 +{
 +	extern std::atomic<bool> g_crema_thread_fairness; // coreinit_Thread.cpp
@@ -7744,6 +7778,17 @@ index 0000000..5a8739a
 +			g_crema_fp32 = number != 0;
 +		else if (name == "framegen")
 +			g_crema_framegen = number != 0;
++		else if (name.rfind("fg_", 0) == 0)
++		{
++			static const char* kNames[kCremaFgParamCount] = {"fg_disagree_low", "fg_disagree_high", "fg_still", "fg_vectors", "fg_radius", "fg_penalty_coarse", "fg_penalty_fine"};
++			int index = -1;
++			for (int i = 0; i < kCremaFgParamCount; i++)
++				if (name == kNames[i])
++					index = i;
++			if (index < 0)
++				return "error: fg_ settings: fg_disagree_low fg_disagree_high fg_still fg_vectors fg_radius fg_penalty_coarse fg_penalty_fine";
++			g_crema_fg_params[index] = strtof(value.c_str(), nullptr);
++		}
 +		else if (name == "latte_slow" && number <= 200)
 +			g_crema_latte_slow = (uint32)number;
 +		else if (name == "hostlayout" && (value == "float" || value == "pinned"))
