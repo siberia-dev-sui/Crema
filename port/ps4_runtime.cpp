@@ -750,10 +750,16 @@ void* mapLargeExecutable(size_t len) {
     const uintptr_t hints[] = {0x1400000000ull, 0x1000000000ull, 0x800000000ull};
     for (uintptr_t hint : hints) {
         void* address = reinterpret_cast<void*>(hint);
-        if (sceKernelReserveVirtualRange(&address, size, 0, 2 * MB) != 0 || reinterpret_cast<uintptr_t>(address) < 0x400000000ull)
+        const int32_t reserved = sceKernelReserveVirtualRange(&address, size, 0, 2 * MB);
+        if (reserved != 0 || reinterpret_cast<uintptr_t>(address) < 0x400000000ull) {
+            heapLog("[cemu] executable memory: no 2 MiB-aligned range near %p for %zu KiB (0x%x, got %p)\n",
+                    reinterpret_cast<void*>(hint), size / 1024, reserved, address);
             continue;
+        }
         void* base = address;
-        if (sceKernelMapDirectMemory(&base, size, PROT_CPU_RWX, MAP_FIXED_FLAG, phys, 2 * MB) != 0 || base != address) {
+        const int32_t mapped = sceKernelMapDirectMemory(&base, size, PROT_CPU_RWX, MAP_FIXED_FLAG, phys, 2 * MB);
+        if (mapped != 0 || base != address) {
+            heapLog("[cemu] executable memory: 2 MiB-aligned direct memory not mapped RWX at %p (0x%x)\n", address, mapped);
             sceKernelMunmap(address, size);
             continue;
         }
