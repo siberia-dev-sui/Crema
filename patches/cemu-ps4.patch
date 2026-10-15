@@ -63,7 +63,7 @@ index d8378c3..a27c3df 100644
 +	ps4_add_eboot(CemuBin)
 +endif()
 diff --git a/src/Cafe/CMakeLists.txt b/src/Cafe/CMakeLists.txt
-index b509e72..d2c396a 100644
+index b509e72..d19fcce 100644
 --- a/src/Cafe/CMakeLists.txt
 +++ b/src/Cafe/CMakeLists.txt
 @@ -548,6 +548,10 @@ if (ENABLE_VULKAN)
@@ -71,7 +71,7 @@ index b509e72..d2c396a 100644
  endif()
  
 +if(PS4 AND ENABLE_VULKAN)
-+	target_sources(CemuCafe PRIVATE HW/Latte/Renderer/Vulkan/PS4WSI.cpp HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp)
++	target_sources(CemuCafe PRIVATE HW/Latte/Renderer/Vulkan/PS4WSI.cpp HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp)
 +endif()
 +
  if(APPLE)
@@ -1341,7 +1341,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..685ec29 100644
+index c9758f3..50e5814 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1784,7 +1784,7 @@ index c9758f3..685ec29 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +720,143 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +720,144 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -1797,6 +1797,7 @@ index c9758f3..685ec29 100644
 +// cr1 and cr5-cr7 dead: the PowerPC EABI makes those fields volatile.
 +bool g_crema_fast_compares = true;
 +extern bool g_crema_fp32; // IML/IMLOptimizer.cpp: single precision arithmetic on raw f32 values
++bool g_crema_lab_before_regalloc = false; // lab only: IML before register allocation
 +
 +static void PPCRecompiler_RemoveDeadCRWrites(ppcImlGenContext_t& ctx)
 +{
@@ -1928,7 +1929,7 @@ index c9758f3..685ec29 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +868,28 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +869,31 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -1947,6 +1948,9 @@ index c9758f3..685ec29 100644
 +		IMLOptimizer_SinglePrecisionArithmetic(ppcImlGenContext);
 +#endif
 +
++	// Crema lab (lab/imlc.cpp): stop here, the IML is translated to C instead
++	if (g_crema_lab_before_regalloc)
++		return true;
 +#ifdef __ORBIS__
 +	const uint64 regallocStart = CremaThreadCpuNs();
 +#endif
@@ -1957,7 +1961,7 @@ index c9758f3..685ec29 100644
  
  	return true;
  }
-@@ -377,6 +911,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +915,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -1966,7 +1970,7 @@ index c9758f3..685ec29 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +924,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +928,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1983,7 +1987,7 @@ index c9758f3..685ec29 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +963,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +967,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1993,7 +1997,7 @@ index c9758f3..685ec29 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +990,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +994,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -2115,7 +2119,7 @@ index c9758f3..685ec29 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1133,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1137,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -2199,7 +2203,7 @@ index c9758f3..685ec29 100644
  	}
  }
  
-@@ -504,6 +1222,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1226,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -2241,7 +2245,7 @@ index c9758f3..685ec29 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1362,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1366,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -2249,7 +2253,7 @@ index c9758f3..685ec29 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -655,6 +1409,15 @@ void PPCRecompiler_initPlatform()
+@@ -655,6 +1413,15 @@ void PPCRecompiler_initPlatform()
  	ppcRecompilerInstanceData->_x64XMM_mxCsr_ftzOn = 0x1F80 | 0x8000;
  	ppcRecompilerInstanceData->_x64XMM_mxCsr_ftzOff = 0x1F80;
  	ppcRecompilerInstanceData->_x64_pextSingleMask = 0xC7FFFFFFE0000000ULL; // sign, exponent bit 62, then bits 58-29
@@ -2265,7 +2269,7 @@ index c9758f3..685ec29 100644
  }
  #else
  void PPCRecompiler_initPlatform()
-@@ -666,6 +1429,15 @@ void PPCRecompiler_initPlatform()
+@@ -666,6 +1433,15 @@ void PPCRecompiler_initPlatform()
  void PPCRecompiler_init()
  {
  	s_ppcRecompilerState.recompilerEnableCount = 0;
@@ -2281,7 +2285,7 @@ index c9758f3..685ec29 100644
  	if (ActiveSettings::GetCPUMode() == CPUMode::SinglecoreInterpreter)
  	{
  		cemuLog_log(LogType::Force, "Using singlecore interpreter");
-@@ -702,7 +1474,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1478,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -2294,7 +2298,7 @@ index c9758f3..685ec29 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1487,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1491,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -2600,7 +2604,7 @@ index de67772..13197f1 100644
  			{
  			case IT_SURFACE_SYNC:
 diff --git a/src/Cafe/HW/Latte/Core/LatteOverlay.cpp b/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
-index 8fdc8f3..45c6142 100644
+index 8fdc8f3..12e8f43 100644
 --- a/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
 @@ -14,6 +14,10 @@
@@ -2614,7 +2618,7 @@ index 8fdc8f3..45c6142 100644
  
  struct OverlayStats
  {
-@@ -68,6 +72,408 @@ struct OverlayList
+@@ -68,6 +72,417 @@ struct OverlayList
  const auto kPopupFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
  
  const float kBackgroundAlpha = 0.65f;
@@ -2633,6 +2637,7 @@ index 8fdc8f3..45c6142 100644
 +extern std::atomic<sint32> g_crema_ra_scan;
 +extern std::atomic<uint64> g_crema_jit_code_bytes; // Espresso/Recompiler/BackendX64/BackendX64.cpp
 +extern std::atomic<uint64_t> g_crema_presents; // Latte/Renderer/Vulkan/PS4WSI.cpp
++extern std::atomic<uint64_t> g_crema_game_frames; // Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +extern uint32 ppcThreadQuantum;
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; }
 +void CremaLive_HudState(std::string& hudLine, std::string& lastResult, int& clients, bool& profilerOn); // gui/ps4/CremaLive.cpp
@@ -2746,6 +2751,8 @@ index 8fdc8f3..45c6142 100644
 +		uint64_t fpsFrames = 0;
 +		double fps = 0.0;
 +		float fpsHistory[64]{}; // one sample per half second, oldest first
++		uint64_t presents = 0;
++		double screenFps = 0.0; // frames shown, with frame generation more than the game makes
 +		int fpsSamples = 0;
 +		int cpuCount = 0;
 +		const char* cpuNames[16]{};
@@ -2758,13 +2765,16 @@ index 8fdc8f3..45c6142 100644
 +	void Update()
 +	{
 +		const auto now = std::chrono::steady_clock::now();
-+		// frame rate from the frames actually presented, every half second
++		// frame rate from the frames the game finished, every half second (and the frames shown)
 +		const double fpsElapsed = std::chrono::duration<double>(now - s_state.fpsTime).count();
 +		if (fpsElapsed >= 0.5)
 +		{
-+			const uint64_t frames = g_crema_presents.load(std::memory_order_relaxed);
++			const uint64_t frames = g_crema_game_frames.load(std::memory_order_relaxed);
++			const uint64_t presents = g_crema_presents.load(std::memory_order_relaxed);
 +			if (s_state.fpsTime != std::chrono::steady_clock::time_point{})
 +			{
++				const double screen = (presents - s_state.presents) / fpsElapsed;
++				s_state.screenFps = s_state.screenFps == 0.0 ? screen : s_state.screenFps * 0.6 + screen * 0.4;
 +				const double fps = (frames - s_state.fpsFrames) / fpsElapsed;
 +				s_state.fps = s_state.fps == 0.0 ? fps : s_state.fps * 0.6 + fps * 0.4;
 +				std::copy(s_state.fpsHistory + 1, s_state.fpsHistory + 64, s_state.fpsHistory);
@@ -2772,6 +2782,7 @@ index 8fdc8f3..45c6142 100644
 +				s_state.fpsSamples = std::min(s_state.fpsSamples + 1, 64);
 +			}
 +			s_state.fpsFrames = frames;
++			s_state.presents = presents;
 +			s_state.fpsTime = now;
 +		}
 +		// busy share of the threads that report their CPU time, every second
@@ -2862,6 +2873,8 @@ index 8fdc8f3..45c6142 100644
 +			constexpr double kGoal = 33.0;
 +			const int filled = (int)std::clamp(s_state.fps / kGoal * 14.0, 0.0, 14.0);
 +			lines.push_back(Line()(kKeyword, "const ")(kIdent, "fps")(kPunct, " = ")(kNumber, Number(s_state.fps, 2))(kPunct, ";"));
++			if (s_state.screenFps > s_state.fps * 1.2)
++				lines.push_back(Line()(kKeyword, "const ")(kIdent, "pantalla")(kPunct, " = ")(kNumber, Number(s_state.screenFps, 2))(kPunct, "; ")(kComment, "// framegen"));
 +			lines.push_back(Line()(kComment, "// goal 33 [")(kAccent, std::string(filled, '#'))(kDim, std::string(14 - filled, '.'))
 +				(kComment, "] ")(kNumber, std::to_string((int)(s_state.fps / kGoal * 100.0)))(kComment, "%"));
 +		}
@@ -3023,7 +3036,7 @@ index 8fdc8f3..45c6142 100644
  void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 direction, float fontSize, bool pad)
  {
  	auto& config = GetConfig();
-@@ -517,7 +923,7 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
+@@ -517,7 +932,7 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
  void LatteOverlay_render(bool pad_view)
  {
  	const auto& config = GetConfig();
@@ -3032,7 +3045,7 @@ index 8fdc8f3..45c6142 100644
  		return;
  
  	sint32 w = 0, h = 0;
-@@ -561,6 +967,9 @@ void LatteOverlay_render(bool pad_view)
+@@ -561,6 +976,9 @@ void LatteOverlay_render(bool pad_view)
  
  		LatteOverlay_RenderNotifications(position, pivot, direction, notificationsFontSize, pad_view);
  	}
@@ -3214,10 +3227,10 @@ index 743ab67..bc6b5cd 100644
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..5a9ef72
+index 0000000..215369e
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,536 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -3494,7 +3507,8 @@ index 0000000..5a9ef72
 +			ici.arrayLayers = 1;
 +			ici.samples = VK_SAMPLE_COUNT_1_BIT;
 +			ici.tiling = VK_IMAGE_TILING_LINEAR;
-+			ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++			// copies in and out for frame generation (VulkanFrameGenPS4.cpp)
++			ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 +			ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 +			VkResult r = createImage(device, &ici, nullptr, &sc->images[i]);
 +			if (r != VK_SUCCESS)
@@ -3891,6 +3905,667 @@ index f503c10..fd4754d 100644
  VKFUNC_DEVICE(vkBindImageMemory);
  
  VKFUNC_DEVICE(vkCreateSampler);
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
+new file mode 100644
+index 0000000..8a89abb
+--- /dev/null
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
+@@ -0,0 +1,581 @@
++// Crema: frame generation on the PS4 (/data/Crema/framegen.txt holding "1", Crema Live: set framegen 0/1).
++// BotW is held back by the emulated Wii U cores (~24 FPS) while the PS4's GPU is mostly idle, so
++// the GPU draws an in-between frame for every game frame, like the motion interpolation of a TV:
++// symmetric block matching between the previous and the current frame on a luma pyramid (1/4 to
++// 1/32 of the screen, coarse to fine) gives a motion vector for every point of the frame in
++// between, which is drawn from both frames moved halfway along it. Where the two sides disagree
++// (occlusions, wrong vectors) it leans on the newer frame. The in-between frame is presented first,
++// in the swapchain image that holds the game frame (PS4WSI shows images in the order they are
++// acquired), and the game frame follows in the next image: two flips per game frame.
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h"
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
++#include "Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.h"
++#include "Cafe/HW/Latte/Renderer/Vulkan/VKRMemoryManager.h"
++#include "Cemu/Logging/CemuLogging.h"
++
++std::atomic<bool> g_crema_framegen{false};
++std::atomic<uint64_t> g_crema_framegen_frames{0};
++
++namespace
++{
++	const char* kVertexShader = R"(#version 450
++layout(location = 0) out vec2 uv;
++void main()
++{
++	vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
++	uv = p;
++	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++)";
++
++	// a 4x4 box of the frame per texel (four bilinear taps), as luma
++	const char* kLumaShader = R"(#version 450
++layout(location = 0) in vec2 uv;
++layout(location = 0) out vec4 outColor;
++layout(set = 0, binding = 0) uniform sampler2D src;
++layout(push_constant) uniform Params { vec4 a; vec4 b; } pc;
++void main()
++{
++	vec2 t = pc.a.xy;
++	vec3 c = texture(src, uv + vec2(-t.x, -t.y)).rgb + texture(src, uv + vec2(t.x, -t.y)).rgb
++		+ texture(src, uv + vec2(-t.x, t.y)).rgb + texture(src, uv + vec2(t.x, t.y)).rgb;
++	outColor = vec4(dot(c, vec3(0.299, 0.587, 0.114)) * 0.25);
++}
++)";
++
++	const char* kDownShader = R"(#version 450
++layout(location = 0) in vec2 uv;
++layout(location = 0) out vec4 outColor;
++layout(set = 0, binding = 0) uniform sampler2D src;
++void main()
++{
++	outColor = vec4(texture(src, uv).r);
++}
++)";
++
++	// Symmetric block matching: the vector d (in texture coordinates) whose two ends, prev at
++	// uv - d/2 and curr at uv + d/2, match best over a 3x3 block, plus a small cost per texel of
++	// motion so flat areas stay still. a.xy: texel size, a.z: search radius in texels, a.w: 0 for a
++	// full search (coarsest level), 1 to refine the coarser level (b.xy: its texel size); b.z: the
++	// motion cost per texel. Out: the vector and its cost.
++	const char* kFlowShader = R"(#version 450
++layout(location = 0) in vec2 uv;
++layout(location = 0) out vec4 outColor;
++layout(set = 0, binding = 0) uniform sampler2D prevLuma;
++layout(set = 0, binding = 1) uniform sampler2D currLuma;
++layout(set = 0, binding = 2) uniform sampler2D coarse;
++layout(push_constant) uniform Params { vec4 a; vec4 b; } pc;
++
++float Cost(vec2 d)
++{
++	vec2 t = pc.a.xy;
++	float s = 0.0;
++	for (int y = -1; y <= 1; y++)
++	{
++		for (int x = -1; x <= 1; x++)
++		{
++			vec2 q = uv + vec2(x, y) * t;
++			s += abs(texture(prevLuma, q - 0.5 * d).r - texture(currLuma, q + 0.5 * d).r);
++		}
++	}
++	return s + pc.b.z * length(d / t);
++}
++
++void main()
++{
++	vec2 t = pc.a.xy;
++	vec2 best = vec2(0.0);
++	float bestCost = Cost(best);
++	if (pc.a.w < 0.5)
++	{
++		int r = int(pc.a.z);
++		for (int y = -r; y <= r; y++)
++		{
++			for (int x = -r; x <= r; x++)
++			{
++				vec2 d = vec2(x, y) * t;
++				float c = Cost(d);
++				if (c < bestCost)
++				{
++					bestCost = c;
++					best = d;
++				}
++			}
++		}
++	}
++	else
++	{
++		// the coarser vector here and at the four neighbours, then one texel around the best
++		vec2 ct = pc.b.xy;
++		vec2 candidates[5] = vec2[5](texture(coarse, uv).xy,
++			texture(coarse, uv + vec2(ct.x, 0.0)).xy, texture(coarse, uv - vec2(ct.x, 0.0)).xy,
++			texture(coarse, uv + vec2(0.0, ct.y)).xy, texture(coarse, uv - vec2(0.0, ct.y)).xy);
++		for (int i = 0; i < 5; i++)
++		{
++			float c = Cost(candidates[i]);
++			if (c < bestCost)
++			{
++				bestCost = c;
++				best = candidates[i];
++			}
++		}
++		vec2 center = best;
++		for (int y = -1; y <= 1; y++)
++		{
++			for (int x = -1; x <= 1; x++)
++			{
++				if (x == 0 && y == 0)
++					continue;
++				vec2 d = center + vec2(x, y) * t;
++				float c = Cost(d);
++				if (c < bestCost)
++				{
++					bestCost = c;
++					best = d;
++				}
++			}
++		}
++	}
++	outColor = vec4(best, bestCost, 1.0);
++}
++)";
++
++	// both frames moved halfway along the vector; where they disagree, the newer one
++	const char* kInterpShader = R"(#version 450
++layout(location = 0) in vec2 uv;
++layout(location = 0) out vec4 outColor;
++layout(set = 0, binding = 0) uniform sampler2D prevColor;
++layout(set = 0, binding = 1) uniform sampler2D currColor;
++layout(set = 0, binding = 2) uniform sampler2D flow;
++void main()
++{
++	vec2 d = texture(flow, uv).xy;
++	vec3 a = texture(prevColor, uv - 0.5 * d).rgb;
++	vec3 b = texture(currColor, uv + 0.5 * d).rgb;
++	vec3 diff = abs(a - b);
++	float w = smoothstep(0.12, 0.35, max(diff.r, max(diff.g, diff.b)));
++	outColor = vec4(mix(0.5 * (a + b), b, w), 1.0);
++}
++)";
++
++	RendererShaderVk* CompileShader(VulkanRenderer* renderer, RendererShader::ShaderType type, const char* source)
++	{
++		auto* shader = static_cast<RendererShaderVk*>(renderer->shader_create(type, 0, 0, source, false, false));
++		shader->PreponeCompilation(true);
++		if (!shader->WaitForCompiled())
++		{
++			cemuLog_log(LogType::Force, "FrameGen: shader failed to compile");
++			return nullptr;
++		}
++		return shader;
++	}
++
++	void ImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess, VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
++	{
++		VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++		b.oldLayout = from;
++		b.newLayout = to;
++		b.srcAccessMask = srcAccess;
++		b.dstAccessMask = dstAccess;
++		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++		b.image = image;
++		b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++		vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
++	}
++
++	VkExtent2D Scaled(VkExtent2D screen, uint32 divisor)
++	{
++		return {(screen.width + divisor - 1) / divisor, (screen.height + divisor - 1) / divisor};
++	}
++
++	CremaFrameGen* s_instance = nullptr;
++	bool s_failed = false;
++}
++
++CremaFrameGen* CremaFrameGen::Get(VulkanRenderer* renderer, VkExtent2D screen)
++{
++	if (s_failed)
++		return nullptr;
++	if (s_instance && (s_instance->m_screen.width != screen.width || s_instance->m_screen.height != screen.height))
++		return nullptr; // the PS4 screen doesn't change size; not handled
++	if (!s_instance)
++	{
++		s_instance = new CremaFrameGen();
++		if (!s_instance->Init(renderer, screen))
++		{
++			cemuLog_log(LogType::Force, "FrameGen: could not be set up, staying off");
++			s_failed = true;
++			return nullptr;
++		}
++		cemuLog_log(LogType::Force, "FrameGen: on, {}x{} with a {}-level motion search", screen.width, screen.height, kLevels);
++	}
++	return s_instance;
++}
++
++VkRenderPass CremaFrameGen::CreateRenderPass(VkFormat format)
++{
++	VkAttachmentDescription attachment{};
++	attachment.format = format;
++	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
++	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++	attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++	VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
++	VkSubpassDescription subpass{};
++	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++	subpass.colorAttachmentCount = 1;
++	subpass.pColorAttachments = &ref;
++	// reads of the previous use before the writes, and the writes before the next pass reads them
++	VkSubpassDependency deps[2]{};
++	deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
++	deps[0].dstSubpass = 0;
++	deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++	deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++	deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
++	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++	deps[1].srcSubpass = 0;
++	deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
++	deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++	deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++	deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++	VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
++	info.attachmentCount = 1;
++	info.pAttachments = &attachment;
++	info.subpassCount = 1;
++	info.pSubpasses = &subpass;
++	info.dependencyCount = 2;
++	info.pDependencies = deps;
++	VkRenderPass pass = VK_NULL_HANDLE;
++	if (vkCreateRenderPass(m_device, &info, nullptr, &pass) != VK_SUCCESS)
++		return VK_NULL_HANDLE;
++	return pass;
++}
++
++bool CremaFrameGen::CreateTarget(Target& t, VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkRenderPass renderPass)
++{
++	t.extent = extent;
++	VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++	ici.imageType = VK_IMAGE_TYPE_2D;
++	ici.format = format;
++	ici.extent = {extent.width, extent.height, 1};
++	ici.mipLevels = 1;
++	ici.arrayLayers = 1;
++	ici.samples = VK_SAMPLE_COUNT_1_BIT;
++	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++	ici.usage = usage;
++	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	if (vkCreateImage(m_device, &ici, nullptr, &t.image) != VK_SUCCESS)
++		return false;
++	VkMemoryRequirements req;
++	vkGetImageMemoryRequirements(m_device, t.image, &req);
++	uint32 typeIndex = 0;
++	if (!m_renderer->GetMemoryManager()->FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, typeIndex))
++	{
++		auto types = m_renderer->GetMemoryManager()->FindMemoryTypes(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++		if (types.empty())
++			return false;
++		typeIndex = types[0];
++	}
++	VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++	mai.allocationSize = req.size;
++	mai.memoryTypeIndex = typeIndex;
++	if (vkAllocateMemory(m_device, &mai, nullptr, &t.memory) != VK_SUCCESS)
++		return false;
++	if (vkBindImageMemory(m_device, t.image, t.memory, 0) != VK_SUCCESS)
++		return false;
++	VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++	vci.image = t.image;
++	vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
++	vci.format = format;
++	vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++	if (vkCreateImageView(m_device, &vci, nullptr, &t.view) != VK_SUCCESS)
++		return false;
++	if (renderPass)
++	{
++		VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
++		fci.renderPass = renderPass;
++		fci.attachmentCount = 1;
++		fci.pAttachments = &t.view;
++		fci.width = extent.width;
++		fci.height = extent.height;
++		fci.layers = 1;
++		if (vkCreateFramebuffer(m_device, &fci, nullptr, &t.framebuffer) != VK_SUCCESS)
++			return false;
++	}
++	return true;
++}
++
++VkPipeline CremaFrameGen::CreatePipeline(RendererShaderVk* fragment, VkRenderPass renderPass)
++{
++	VkPipelineShaderStageCreateInfo stages[2]{};
++	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++	stages[0].module = m_vertex->GetShaderModule();
++	stages[0].pName = "main";
++	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++	stages[1].module = fragment->GetShaderModule();
++	stages[1].pName = "main";
++	VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++	VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++	VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++	viewport.viewportCount = 1;
++	viewport.scissorCount = 1;
++	VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++	VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++	dynamic.dynamicStateCount = 2;
++	dynamic.pDynamicStates = dynamicStates;
++	VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++	raster.polygonMode = VK_POLYGON_MODE_FILL;
++	raster.cullMode = VK_CULL_MODE_NONE;
++	raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
++	raster.lineWidth = 1.0f;
++	VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++	VkPipelineColorBlendAttachmentState blendAttachment{};
++	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++	VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++	blend.attachmentCount = 1;
++	blend.pAttachments = &blendAttachment;
++	VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++	info.stageCount = 2;
++	info.pStages = stages;
++	info.pVertexInputState = &vertexInput;
++	info.pInputAssemblyState = &inputAssembly;
++	info.pViewportState = &viewport;
++	info.pDynamicState = &dynamic;
++	info.pRasterizationState = &raster;
++	info.pMultisampleState = &multisample;
++	info.pColorBlendState = &blend;
++	info.layout = m_pipelineLayout;
++	info.renderPass = renderPass;
++	VkPipeline pipeline = VK_NULL_HANDLE;
++	if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) != VK_SUCCESS)
++		return VK_NULL_HANDLE;
++	return pipeline;
++}
++
++VkDescriptorSet CremaFrameGen::CreateSet(VkImageView a, VkImageView b, VkImageView c)
++{
++	VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++	ai.descriptorPool = m_pool;
++	ai.descriptorSetCount = 1;
++	ai.pSetLayouts = &m_setLayout;
++	VkDescriptorSet set = VK_NULL_HANDLE;
++	if (vkAllocateDescriptorSets(m_device, &ai, &set) != VK_SUCCESS)
++		return VK_NULL_HANDLE;
++	VkDescriptorImageInfo images[3];
++	VkWriteDescriptorSet writes[3]{};
++	VkImageView views[3] = {a, b, c};
++	for (uint32 i = 0; i < 3; i++)
++	{
++		images[i] = {m_sampler, views[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
++		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++		writes[i].dstSet = set;
++		writes[i].dstBinding = i;
++		writes[i].descriptorCount = 1;
++		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++		writes[i].pImageInfo = &images[i];
++	}
++	vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
++	return set;
++}
++
++bool CremaFrameGen::Init(VulkanRenderer* renderer, VkExtent2D screen)
++{
++	m_renderer = renderer;
++	m_device = renderer->GetLogicalDevice();
++	m_screen = screen;
++	m_passLuma = CreateRenderPass(VK_FORMAT_R16_SFLOAT);
++	m_passFlow = CreateRenderPass(VK_FORMAT_R16G16B16A16_SFLOAT);
++	if (!m_passLuma || !m_passFlow)
++		return false;
++	for (int p = 0; p < 2; p++)
++	{
++		if (!CreateTarget(m_color[p], screen, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_NULL_HANDLE))
++			return false;
++		for (int l = 0; l < kLevels; l++)
++			if (!CreateTarget(m_luma[p][l], Scaled(screen, 4u << l), VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m_passLuma))
++				return false;
++	}
++	for (int l = 0; l < kLevels; l++)
++		if (!CreateTarget(m_flow[l], Scaled(screen, 4u << l), VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m_passFlow))
++			return false;
++
++	VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++	sci.magFilter = VK_FILTER_LINEAR;
++	sci.minFilter = VK_FILTER_LINEAR;
++	sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++	sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++	sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++	sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++	sci.maxLod = 0.0f;
++	if (vkCreateSampler(m_device, &sci, nullptr, &m_sampler) != VK_SUCCESS)
++		return false;
++
++	VkDescriptorSetLayoutBinding bindings[3]{};
++	for (uint32 i = 0; i < 3; i++)
++	{
++		bindings[i].binding = i;
++		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++		bindings[i].descriptorCount = 1;
++		bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++	}
++	VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++	lci.bindingCount = 3;
++	lci.pBindings = bindings;
++	if (vkCreateDescriptorSetLayout(m_device, &lci, nullptr, &m_setLayout) != VK_SUCCESS)
++		return false;
++	VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
++	VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++	pli.setLayoutCount = 1;
++	pli.pSetLayouts = &m_setLayout;
++	pli.pushConstantRangeCount = 1;
++	pli.pPushConstantRanges = &push;
++	if (vkCreatePipelineLayout(m_device, &pli, nullptr, &m_pipelineLayout) != VK_SUCCESS)
++		return false;
++	const uint32 setCount = 2 * (2 + 2 * kLevels);
++	VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setCount * 3};
++	VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++	dpi.maxSets = setCount;
++	dpi.poolSizeCount = 1;
++	dpi.pPoolSizes = &poolSize;
++	if (vkCreateDescriptorPool(m_device, &dpi, nullptr, &m_pool) != VK_SUCCESS)
++		return false;
++
++	m_vertex = CompileShader(renderer, RendererShader::ShaderType::kVertex, kVertexShader);
++	RendererShaderVk* luma = CompileShader(renderer, RendererShader::ShaderType::kFragment, kLumaShader);
++	RendererShaderVk* down = CompileShader(renderer, RendererShader::ShaderType::kFragment, kDownShader);
++	RendererShaderVk* flow = CompileShader(renderer, RendererShader::ShaderType::kFragment, kFlowShader);
++	m_interpShader = CompileShader(renderer, RendererShader::ShaderType::kFragment, kInterpShader);
++	if (!m_vertex || !luma || !down || !flow || !m_interpShader)
++		return false;
++	m_pipeLuma = CreatePipeline(luma, m_passLuma);
++	m_pipeDown = CreatePipeline(down, m_passLuma);
++	m_pipeFlow = CreatePipeline(flow, m_passFlow);
++	if (!m_pipeLuma || !m_pipeDown || !m_pipeFlow)
++		return false;
++
++	for (int p = 0; p < 2; p++)
++	{
++		const int q = p ^ 1; // the previous frame
++		VkImageView any = m_luma[p][0].view;
++		m_setLuma[p] = CreateSet(m_color[p].view, any, any);
++		for (int l = 1; l < kLevels; l++)
++			m_setDown[p][l] = CreateSet(m_luma[p][l - 1].view, any, any);
++		for (int l = 0; l < kLevels; l++)
++			m_setFlow[p][l] = CreateSet(m_luma[q][l].view, m_luma[p][l].view, l + 1 < kLevels ? m_flow[l + 1].view : any);
++		m_setInterp[p] = CreateSet(m_color[q].view, m_color[p].view, m_flow[0].view);
++		if (!m_setLuma[p] || !m_setInterp[p])
++			return false;
++	}
++	m_ok = true;
++	return true;
++}
++
++void CremaFrameGen::Pass(VkCommandBuffer cmd, VkPipeline pipeline, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent, VkDescriptorSet set, const float* params)
++{
++	VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++	rp.renderPass = renderPass;
++	rp.framebuffer = framebuffer;
++	rp.renderArea = {{0, 0}, extent};
++	vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
++	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++	VkViewport viewport{0.0f, 0.0f, (float)extent.width, (float)extent.height, 0.0f, 1.0f};
++	vkCmdSetViewport(cmd, 0, 1, &viewport);
++	VkRect2D scissor{{0, 0}, extent};
++	vkCmdSetScissor(cmd, 0, 1, &scissor);
++	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &set, 0, nullptr);
++	float zero[8]{};
++	vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, params ? params : zero);
++	vkCmdDraw(cmd, 3, 1, 0, 0);
++	vkCmdEndRenderPass(cmd);
++}
++
++bool CremaFrameGen::Analyze(VkCommandBuffer cmd, VkImage swapchainImage)
++{
++	if (!m_ok)
++		return false;
++	const int p = m_parity;
++	Target& color = m_color[p];
++	// the frame: swapchain image -> color[p]
++	ImageBarrier(cmd, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++	ImageBarrier(cmd, color.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++	VkImageCopy region{};
++	region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.extent = {m_screen.width, m_screen.height, 1};
++	vkCmdCopyImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++	ImageBarrier(cmd, color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
++	// back to presentable; the in-between frame may be drawn into it next
++	ImageBarrier(cmd, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++
++	// luma pyramid of this frame
++	float lumaParams[8] = {1.0f / m_screen.width, 1.0f / m_screen.height};
++	Pass(cmd, m_pipeLuma, m_passLuma, m_luma[p][0].framebuffer, m_luma[p][0].extent, m_setLuma[p], lumaParams);
++	for (int l = 1; l < kLevels; l++)
++		Pass(cmd, m_pipeDown, m_passLuma, m_luma[p][l].framebuffer, m_luma[p][l].extent, m_setDown[p][l], nullptr);
++	if (!m_havePrevious)
++		return false;
++
++	// motion, coarse to fine
++	for (int l = kLevels - 1; l >= 0; l--)
++	{
++		const VkExtent2D e = m_flow[l].extent;
++		const bool coarsest = l == kLevels - 1;
++		const VkExtent2D c = coarsest ? e : m_flow[l + 1].extent;
++		float params[8] = {1.0f / e.width, 1.0f / e.height, coarsest ? 5.0f : 1.0f, coarsest ? 0.0f : 1.0f,
++			1.0f / c.width, 1.0f / c.height, coarsest ? 0.01f : 0.004f, 0.0f};
++		Pass(cmd, m_pipeFlow, m_passFlow, m_flow[l].framebuffer, e, m_setFlow[p][l], params);
++	}
++	return true;
++}
++
++void CremaFrameGen::DrawIntermediate(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer)
++{
++	if (m_interpRenderPass != renderPass)
++	{
++		// made for the swapchain render pass (again after a swapchain is recreated)
++		if (m_pipeInterp)
++			vkDestroyPipeline(m_device, m_pipeInterp, nullptr);
++		m_pipeInterp = CreatePipeline(m_interpShader, renderPass);
++		m_interpRenderPass = renderPass;
++	}
++	if (!m_pipeInterp)
++		return;
++	Pass(cmd, m_pipeInterp, renderPass, framebuffer, m_screen, m_setInterp[m_parity], nullptr);
++}
++
++void CremaFrameGen::CopyCurrentTo(VkCommandBuffer cmd, VkImage swapchainImage)
++{
++	Target& color = m_color[m_parity];
++	ImageBarrier(cmd, swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++		0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++	ImageBarrier(cmd, color.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++		VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++	VkImageCopy region{};
++	region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++	region.extent = {m_screen.width, m_screen.height, 1};
++	vkCmdCopyImage(cmd, color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++	ImageBarrier(cmd, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++	ImageBarrier(cmd, color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
++}
++
++void CremaFrameGen::EndFrame()
++{
++	m_parity ^= 1;
++	m_havePrevious = true;
++}
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h
+new file mode 100644
+index 0000000..c373582
+--- /dev/null
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h
+@@ -0,0 +1,68 @@
++#pragma once
++// Crema: frame generation on the PS4 (VulkanFrameGenPS4.cpp)
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++
++class VulkanRenderer;
++
++extern std::atomic<bool> g_crema_framegen; // framegen.txt, Crema Live: set framegen 0/1
++extern std::atomic<uint64_t> g_crema_framegen_frames; // in-between frames presented
++
++class CremaFrameGen
++{
++public:
++	// the instance for this screen size, created on first use; null if it can't run
++	static CremaFrameGen* Get(VulkanRenderer* renderer, VkExtent2D screen);
++
++	// after the game frame is complete in the swapchain image (layout PRESENT_SRC): copies it and
++	// estimates the motion from the previous frame. False on the first frame after a pause (the
++	// image is left as it was, to be presented normally).
++	bool Analyze(VkCommandBuffer cmd, VkImage swapchainImage);
++	// the in-between frame into a swapchain framebuffer (the swapchain render pass)
++	void DrawIntermediate(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer);
++	// the game frame copied by Analyze into another swapchain image (leaves it in PRESENT_SRC)
++	void CopyCurrentTo(VkCommandBuffer cmd, VkImage swapchainImage);
++	void EndFrame();
++	// the next frame has no previous one (frame generation was off, or a frame was skipped)
++	void Restart() { m_havePrevious = false; }
++
++private:
++	struct Target
++	{
++		VkImage image = VK_NULL_HANDLE;
++		VkDeviceMemory memory = VK_NULL_HANDLE;
++		VkImageView view = VK_NULL_HANDLE;
++		VkFramebuffer framebuffer = VK_NULL_HANDLE;
++		VkExtent2D extent{};
++	};
++	static constexpr int kLevels = 4; // luma pyramid: 1/4, 1/8, 1/16 and 1/32 of the screen
++
++	bool Init(VulkanRenderer* renderer, VkExtent2D screen);
++	bool CreateTarget(Target& t, VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, VkRenderPass renderPass);
++	VkRenderPass CreateRenderPass(VkFormat format);
++	VkPipeline CreatePipeline(class RendererShaderVk* fragment, VkRenderPass renderPass);
++	VkDescriptorSet CreateSet(VkImageView a, VkImageView b, VkImageView c);
++	void Pass(VkCommandBuffer cmd, VkPipeline pipeline, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent, VkDescriptorSet set, const float* params);
++
++	VulkanRenderer* m_renderer = nullptr;
++	VkDevice m_device = VK_NULL_HANDLE;
++	VkExtent2D m_screen{};
++	bool m_ok = false;
++	bool m_havePrevious = false;
++	int m_parity = 0; // m_color[m_parity] is the current frame, m_color[m_parity ^ 1] the previous one
++
++	Target m_color[2];
++	Target m_luma[2][kLevels];
++	Target m_flow[kLevels];
++	VkRenderPass m_passLuma = VK_NULL_HANDLE;
++	VkRenderPass m_passFlow = VK_NULL_HANDLE;
++	VkSampler m_sampler = VK_NULL_HANDLE;
++	VkDescriptorSetLayout m_setLayout = VK_NULL_HANDLE;
++	VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
++	VkDescriptorPool m_pool = VK_NULL_HANDLE;
++	class RendererShaderVk* m_vertex = nullptr;
++	VkPipeline m_pipeLuma = VK_NULL_HANDLE, m_pipeDown = VK_NULL_HANDLE, m_pipeFlow = VK_NULL_HANDLE, m_pipeInterp = VK_NULL_HANDLE;
++	VkRenderPass m_interpRenderPass = VK_NULL_HANDLE; // the swapchain render pass m_pipeInterp was made for
++	class RendererShaderVk* m_interpShader = nullptr;
++	// per parity: luma, downsample per level, flow per level, interpolation
++	VkDescriptorSet m_setLuma[2]{}, m_setDown[2][kLevels]{}, m_setFlow[2][kLevels]{}, m_setInterp[2]{};
++};
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 index 7179087..af4a1d9 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
@@ -4781,7 +5456,7 @@ index 0000000..4a49a18
 +	return s_enabled && s_deferred.load(std::memory_order_relaxed);
 +}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..a7c90eb 100644
+index 599190a..b5dfe16 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -1,3 +1,6 @@
@@ -4791,7 +5466,18 @@ index 599190a..a7c90eb 100644
  #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
  #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
  #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.h"
-@@ -113,6 +116,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
+@@ -5,6 +8,10 @@
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/CocoaSurface.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
++#ifdef __ORBIS__
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.h"
++std::atomic<uint64_t> g_crema_game_frames{0}; // frames the game finished (Crema Live fps; the presents double with frame generation)
++#endif
+ 
+ #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
+ #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
+@@ -113,6 +120,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
  	requiredExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -4800,7 +5486,7 @@ index 599190a..a7c90eb 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -757,6 +762,9 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+@@ -757,6 +766,9 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
  	}
  
  	InitializeDeviceVulkan(m_logicalDevice);
@@ -4810,7 +5496,7 @@ index 599190a..a7c90eb 100644
  
  	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_graphicsQueue);
  	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_presentQueue);
-@@ -876,6 +884,9 @@ VulkanRenderer::~VulkanRenderer()
+@@ -876,6 +888,9 @@ VulkanRenderer::~VulkanRenderer()
  	}
  
  	vkDestroyDescriptorPool(m_logicalDevice, m_descriptorPool, nullptr);
@@ -4820,7 +5506,7 @@ index 599190a..a7c90eb 100644
  
  	for(auto& i : m_backbufferBlitPipelineCache)
  	{
-@@ -1491,6 +1502,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+@@ -1491,6 +1506,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
  	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -4829,7 +5515,7 @@ index 599190a..a7c90eb 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1578,7 +1591,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+@@ -1578,7 +1595,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
  }
  #endif
  
@@ -4838,7 +5524,7 @@ index 599190a..a7c90eb 100644
  VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
  {
      VkXlibSurfaceCreateInfoKHR sci{};
-@@ -1642,6 +1655,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+@@ -1642,6 +1659,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
  {
  #if BOOST_OS_WINDOWS
  	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
@@ -4847,7 +5533,7 @@ index 599190a..a7c90eb 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -2280,7 +2295,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+@@ -2280,7 +2299,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
  	occlusionQuery_notifyBeginCommandBuffer();
  
  	m_recordedDrawcalls = 0;
@@ -4861,29 +5547,153 @@ index 599190a..a7c90eb 100644
  	m_submitOnIdle = false;
  }
  
-@@ -3038,7 +3059,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3029,6 +3054,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
+ 	auto& chainInfo = GetChainInfo(mainWindow);
+ 
++#ifdef __ORBIS__
++	// Crema: an in-between frame before this one (VulkanFrameGenPS4.cpp)
++	if (mainWindow && SwapBufferFrameGen(chainInfo))
++		return;
++#endif
++
+ 	if (!chainInfo.hasDefinedSwapchainImage)
+ 	{
+ 		// set the swapchain image to a defined state
+@@ -3036,18 +3067,37 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+ 		ClearColorImageRaw(chainInfo.m_swapchainImages[chainInfo.swapchainImageIndex], 0, 0, clearColor, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+ 	}
+ 
++	PresentSwapchainImage(chainInfo, chainInfo.swapchainImageIndex, true);
++
++	chainInfo.hasDefinedSwapchainImage = false;
++
++	chainInfo.swapchainImageIndex = -1;
++}
++
++// submits what was recorded and presents one swapchain image; waitPreviousFrame: the once-per-frame
++// wait for the previous frame's commands
++void VulkanRenderer::PresentSwapchainImage(SwapchainInfoVk& chainInfo, uint32 imageIndex, bool waitPreviousFrame)
++{
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
+-	VkSemaphore presentSemaphore = chainInfo.m_presentSemaphores[chainInfo.swapchainImageIndex];
 +#ifdef __ORBIS__
 +	// PS4WSI.cpp queues the flip behind this submit on the same in-order queue: no semaphore needed
 +	VkSemaphore presentSemaphore = VK_NULL_HANDLE;
 +#else
- 	VkSemaphore presentSemaphore = chainInfo.m_presentSemaphores[chainInfo.swapchainImageIndex];
++	VkSemaphore presentSemaphore = chainInfo.m_presentSemaphores[imageIndex];
 +#endif
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3083,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+ 
+-	// wait for the previous frame to finish rendering
+-	WaitCommandBufferFinished(m_commandBufferIDOfPrevFrame);
+-	m_commandBufferIDOfPrevFrame = currentFrameCmdBufferID;
++	if (waitPreviousFrame)
++	{
++		// wait for the previous frame to finish rendering
++		WaitCommandBufferFinished(m_commandBufferIDOfPrevFrame);
++		m_commandBufferIDOfPrevFrame = currentFrameCmdBufferID;
+ 
+-	chainInfo.WaitAvailableFence();
++		chainInfo.WaitAvailableFence();
++	}
+ 
+ 	VkPresentIdKHR presentId = {};
+ 
+@@ -3055,9 +3105,9 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+ 	presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+ 	presentInfo.swapchainCount = 1;
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
- 	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
+-	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
++	presentInfo.pImageIndices = &imageIndex;
  	// wait on command buffer semaphore
 -	presentInfo.waitSemaphoreCount = 1;
 +	presentInfo.waitSemaphoreCount = presentSemaphore != VK_NULL_HANDLE ? 1 : 0;
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3282,6 +3308,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3091,11 +3141,65 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+ 		chainInfo.m_queueDepth++;
+ 		chainInfo.m_presentId++;
+ 	}
++}
+ 
+-	chainInfo.hasDefinedSwapchainImage = false;
++#ifdef __ORBIS__
++// Crema: frame generation. The game frame is complete in the acquired image; the in-between frame
++// is drawn into that same image and presented first (PS4WSI shows images in the order they are
++// acquired), then the game frame goes into the next image. False: present as usual.
++bool VulkanRenderer::SwapBufferFrameGen(SwapchainInfoVk& chainInfo)
++{
++	static bool s_wasOn = false;
++	static bool s_switchRead = false;
++	if (!s_switchRead)
++	{
++		s_switchRead = true;
++		if (FILE* f = fopen("/data/Crema/framegen.txt", "rb"))
++		{
++			g_crema_framegen = fgetc(f) == '1';
++			fclose(f);
++			cemuLog_log(LogType::Force, "FrameGen: {} (/data/Crema/framegen.txt)", g_crema_framegen.load() ? "on" : "off");
++		}
++	}
++	const bool on = g_crema_framegen.load(std::memory_order_relaxed) && chainInfo.hasDefinedSwapchainImage;
++	CremaFrameGen* fg = on ? CremaFrameGen::Get(this, chainInfo.getExtent()) : nullptr;
++	if (!fg)
++	{
++		s_wasOn = false;
++		return false;
++	}
++	if (!s_wasOn)
++		fg->Restart();
++	s_wasOn = true;
++	draw_endRenderPass();
++	const uint32 gameImage = chainInfo.swapchainImageIndex;
++	if (!fg->Analyze(m_state.currentCommandBuffer, chainInfo.m_swapchainImages[gameImage]))
++	{
++		fg->EndFrame();
++		return false;
++	}
++	fg->DrawIntermediate(m_state.currentCommandBuffer, chainInfo.m_swapchainRenderPass, chainInfo.m_swapchainFramebuffers[gameImage]);
++	// Cemu binds its own pipeline, viewport and descriptor sets again
++	m_state.currentPipeline = VK_NULL_HANDLE;
++	m_state.descriptorSetsChanged = true;
++	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
++	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &m_state.currentScissorRect);
++	PresentSwapchainImage(chainInfo, gameImage, true);
++	g_crema_framegen_frames.fetch_add(1, std::memory_order_relaxed);
+ 
++	// the game frame, in the next image
++	chainInfo.hasDefinedSwapchainImage = false;
+ 	chainInfo.swapchainImageIndex = -1;
++	if (AcquireNextSwapchainImage(true))
++	{
++		fg->CopyCurrentTo(m_state.currentCommandBuffer, chainInfo.m_swapchainImages[chainInfo.swapchainImageIndex]);
++		PresentSwapchainImage(chainInfo, chainInfo.swapchainImageIndex, false);
++		chainInfo.swapchainImageIndex = -1;
++	}
++	fg->EndFrame();
++	return true;
+ }
++#endif
+ 
+ void VulkanRenderer::Flush(bool waitIdle)
+ {
+@@ -3116,6 +3220,10 @@ void VulkanBenchmarkPrintResults();
+ void VulkanRenderer::SwapBuffers(bool swapTV, bool swapDRC)
+ {
+ 	SubmitCommandBuffer();
++#ifdef __ORBIS__
++	if (swapTV)
++		g_crema_game_frames.fetch_add(1, std::memory_order_relaxed);
++#endif
+ 
+ 	if (swapTV && IsSwapchainInfoValid(true))
+ 		SwapBuffer(true);
+@@ -3282,6 +3390,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -4933,7 +5743,7 @@ index 599190a..a7c90eb 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3369,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3451,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4946,7 +5756,7 @@ index 599190a..a7c90eb 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -4379,6 +4450,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4532,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -4955,7 +5765,7 @@ index 599190a..a7c90eb 100644
  	performanceMonitor.vk.numDescriptorSets.decrement();
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index d975e11..d5a9239 100644
+index d975e11..956170c 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -212,7 +212,7 @@ public:
@@ -4984,6 +5794,17 @@ index d975e11..d5a9239 100644
  
    public:
  	struct QueueFamilyIndices
+@@ -500,6 +503,10 @@ private:
+ 
+ 	bool UpdateSwapchainProperties(bool mainWindow);
+ 	void SwapBuffer(bool mainWindow);
++	void PresentSwapchainImage(SwapchainInfoVk& chainInfo, uint32 imageIndex, bool waitPreviousFrame);
++#ifdef __ORBIS__
++	bool SwapBufferFrameGen(SwapchainInfoVk& chainInfo); // Crema: VulkanFrameGenPS4.cpp
++#endif
+ 
+ 	VkDescriptorSetLayout m_swapchainDescriptorSetLayout;
+ 
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 index 512ebee..a8b3a5a 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
@@ -6785,10 +7606,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..fa229ae
+index 0000000..5a8739a
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,536 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -6850,6 +7671,8 @@ index 0000000..fa229ae
 +extern std::atomic<bool> g_crema_count_branches; // Recompiler/BackendX64/BackendX64.cpp
 +extern uint64 g_crema_branch_counts[2];
 +extern std::atomic<uint64_t> g_crema_presents; // HW/Latte/Renderer/Vulkan/PS4WSI.cpp
++extern std::atomic<uint64_t> g_crema_game_frames; // HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
++extern std::atomic<bool> g_crema_framegen; // HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
 +namespace coreinit
 +{
 +	extern std::atomic<bool> g_crema_thread_fairness; // coreinit_Thread.cpp
@@ -6891,10 +7714,10 @@ index 0000000..fa229ae
 +	std::string Values()
 +	{
 +		char line[256];
-+		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d latte_slow=%u vk_thread=%d prof=%d fp32=%d",
++		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d latte_slow=%u vk_thread=%d prof=%d fp32=%d framegen=%d",
 +			g_crema_fast_cycles ? 1 : 0, g_crema_cl_shifts ? 1 : 0, g_crema_fast_compares ? 1 : 0,
 +			(unsigned long long)g_crema_ra_budget.load(), (int)g_crema_ra_scan.load(), ppcThreadQuantum,
-+			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, g_crema_latte_slow.load(), CremaVkRecorder_Deferred() ? 1 : 0, s_profilerOn.load() ? 1 : 0, g_crema_fp32 ? 1 : 0);
++			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, g_crema_latte_slow.load(), CremaVkRecorder_Deferred() ? 1 : 0, s_profilerOn.load() ? 1 : 0, g_crema_fp32 ? 1 : 0, g_crema_framegen.load() ? 1 : 0);
 +		return line;
 +	}
 +
@@ -6919,6 +7742,8 @@ index 0000000..fa229ae
 +			g_crema_count_branches = number != 0;
 +		else if (name == "fp32")
 +			g_crema_fp32 = number != 0;
++		else if (name == "framegen")
++			g_crema_framegen = number != 0;
 +		else if (name == "latte_slow" && number <= 200)
 +			g_crema_latte_slow = (uint32)number;
 +		else if (name == "hostlayout" && (value == "float" || value == "pinned"))
@@ -6980,14 +7805,20 @@ index 0000000..fa229ae
 +			return "error: seconds between 0 and 600";
 +		CpuSnapshot cpu0, cpu1;
 +		cpu0.Take();
-+		const uint64_t frames0 = g_crema_presents.load(std::memory_order_relaxed);
++		// fps: frames the game finished; with frame generation the screen gets more (shown apart)
++		const uint64_t frames0 = g_crema_game_frames.load(std::memory_order_relaxed);
++		const uint64_t presents0 = g_crema_presents.load(std::memory_order_relaxed);
 +		const auto t0 = std::chrono::steady_clock::now();
 +		std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
-+		const uint64_t frames = g_crema_presents.load(std::memory_order_relaxed) - frames0;
++		const uint64_t frames = g_crema_game_frames.load(std::memory_order_relaxed) - frames0;
++		const uint64_t presents = g_crema_presents.load(std::memory_order_relaxed) - presents0;
 +		const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 +		cpu1.Take();
-+		char line[128];
-+		snprintf(line, sizeof(line), "fps %.2f frames %llu secs %.1f", frames / secs, (unsigned long long)frames, secs);
++		char line[160];
++		if (presents > frames + frames / 8)
++			snprintf(line, sizeof(line), "fps %.2f frames %llu secs %.1f pantalla %.2f", frames / secs, (unsigned long long)frames, secs, presents / secs);
++		else
++			snprintf(line, sizeof(line), "fps %.2f frames %llu secs %.1f", frames / secs, (unsigned long long)frames, secs);
 +		return std::string(line) + " | " + BusyText(cpu0, cpu1, secs);
 +	}
 +
