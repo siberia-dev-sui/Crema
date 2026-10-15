@@ -398,6 +398,95 @@ index e466deb..fabca63 100644
  	std::lock_guard<std::mutex> lck(mtx_allocExecutableMemory);
  	if( codeMemoryBlockIndex+size > codeMemoryBlockSize )
  	{
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h
+index 8f58d2f..163a925 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h
+@@ -224,6 +224,10 @@ void x64Gen_mulsd_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegist
+ void x64Gen_mulpd_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
+ void x64Gen_mulpd_xmmReg_memReg128(x64GenContext_t* x64GenContext, sint32 xmmRegister, sint32 memRegister, uint32 memImmU32);
+ void x64Gen_divsd_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
++void x64Gen_addss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
++void x64Gen_subss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
++void x64Gen_mulss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
++void x64Gen_divss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
+ void x64Gen_divpd_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
+ void x64Gen_comisd_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc);
+ void x64Gen_comisd_xmmReg_mem64Reg64(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 memoryReg, sint32 memImmS32);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp
+index 8751a04..1bb8133 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp
+@@ -332,6 +332,15 @@ void PPCRecompilerX64Gen_imlInstruction_fpr_r_r(PPCRecFunction_t* PPCRecFunction
+ 	{
+ 		x64Gen_subsd_xmmReg_xmmReg(x64GenContext, regR, regA);
+ 	}
++	// Crema: raw f32 operands and result (IMLOptimizer_SinglePrecisionArithmetic)
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_MULTIPLY_F32)
++		x64Gen_mulss_xmmReg_xmmReg(x64GenContext, regR, regA);
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_DIVIDE_F32)
++		x64Gen_divss_xmmReg_xmmReg(x64GenContext, regR, regA);
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_ADD_F32)
++		x64Gen_addss_xmmReg_xmmReg(x64GenContext, regR, regA);
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_SUB_F32)
++		x64Gen_subss_xmmReg_xmmReg(x64GenContext, regR, regA);
+ 	else if( imlInstruction->operation == PPCREC_IML_OP_FPR_FCTIWZ )
+ 	{
+ 		x64Gen_cvttsd2si_xmmReg_xmmReg(x64GenContext, REG_RESV_TEMP, regA);
+@@ -405,6 +414,37 @@ void PPCRecompilerX64Gen_imlInstruction_fpr_r_r_r(PPCRecFunction_t* PPCRecFuncti
+ 			x64Gen_subsd_xmmReg_xmmReg(x64GenContext, regR, regB);
+ 		}
+ 	}
++	// Crema: raw f32 operands and result, operand order as the double versions above (same NaN choice)
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_MULTIPLY_F32 || imlInstruction->operation == PPCREC_IML_OP_FPR_ADD_F32)
++	{
++		auto op = imlInstruction->operation == PPCREC_IML_OP_FPR_MULTIPLY_F32 ? x64Gen_mulss_xmmReg_xmmReg : x64Gen_addss_xmmReg_xmmReg;
++		if (regR == regA)
++			op(x64GenContext, regR, regB);
++		else if (regR == regB)
++			op(x64GenContext, regR, regA);
++		else
++		{
++			x64Gen_movsd_xmmReg_xmmReg(x64GenContext, regR, regA);
++			op(x64GenContext, regR, regB);
++		}
++	}
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_SUB_F32 || imlInstruction->operation == PPCREC_IML_OP_FPR_DIVIDE_F32)
++	{
++		auto op = imlInstruction->operation == PPCREC_IML_OP_FPR_SUB_F32 ? x64Gen_subss_xmmReg_xmmReg : x64Gen_divss_xmmReg_xmmReg;
++		if (regR == regA)
++			op(x64GenContext, regR, regB);
++		else if (regR == regB)
++		{
++			x64Gen_movsd_xmmReg_xmmReg(x64GenContext, REG_RESV_FPR_TEMP, regA);
++			op(x64GenContext, REG_RESV_FPR_TEMP, regB);
++			x64Gen_movsd_xmmReg_xmmReg(x64GenContext, regR, REG_RESV_FPR_TEMP);
++		}
++		else
++		{
++			x64Gen_movsd_xmmReg_xmmReg(x64GenContext, regR, regA);
++			op(x64GenContext, regR, regB);
++		}
++	}
+ 	else
+ 		assert_dbg();
+ }
+@@ -470,6 +510,15 @@ void PPCRecompilerX64Gen_imlInstruction_fpr_r(PPCRecFunction_t* PPCRecFunction,
+ 		// convert bottom to 64bit double
+ 		x64Gen_cvtss2sd_xmmReg_xmmReg(x64GenContext, regR, regR);
+ 	}
++	// Crema: raw f32 values (IMLOptimizer_SinglePrecisionArithmetic)
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_ROUND_TO_F32)
++		x64Gen_cvtsd2ss_xmmReg_xmmReg(x64GenContext, regR, regR);
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_NEGATE_F32)
++		x64Gen_xorps_xmmReg_mem128Reg64(x64GenContext, regR, REG_RESV_RECDATA, offsetof(PPCRecompilerInstanceData_t, _x64XMM_xorNegateMaskBottomF32));
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_ABS_F32)
++		x64Gen_andps_xmmReg_mem128Reg64(x64GenContext, regR, REG_RESV_RECDATA, offsetof(PPCRecompilerInstanceData_t, _x64XMM_andAbsMaskBottomF32));
++	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_NEGATIVE_ABS_F32)
++		x64Gen_orps_xmmReg_mem128Reg64(x64GenContext, regR, REG_RESV_RECDATA, offsetof(PPCRecompilerInstanceData_t, _x64XMM_xorNegateMaskBottomF32));
+ 	else
+ 	{
+ 		cemu_assert_unimplemented();
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
 index d4b41b9..b111c13 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
@@ -445,6 +534,559 @@ index d4b41b9..b111c13 100644
  	else if( srcRegister >= 4 )
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64GenFPU.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64GenFPU.cpp
+index c225d7d..f7feab3 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64GenFPU.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64GenFPU.cpp
+@@ -800,4 +800,19 @@ void x64Gen_movq_reg64_xmmReg(x64GenContext_t* x64GenContext, sint32 registerDst
+ 	x64Gen_writeU8(x64GenContext, 0x0F);
+ 	x64Gen_writeU8(x64GenContext, 0x7E);
+ 	x64Gen_writeU8(x64GenContext, 0xC0+(xmmRegisterSrc&7)*8+(registerDst&7));
+-}
+\ No newline at end of file
++}
++
++// Crema: scalar single precision, bottom float of two xmm registers (the rest of the destination is left as is)
++static void x64Gen_ssOp_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc, uint8 opcode)
++{
++	x64Gen_writeU8(x64GenContext, 0xF3);
++	x64Gen_genSSEVEXPrefix2(x64GenContext, xmmRegisterSrc, xmmRegisterDest, false);
++	x64Gen_writeU8(x64GenContext, 0x0F);
++	x64Gen_writeU8(x64GenContext, opcode);
++	x64Gen_writeU8(x64GenContext, 0xC0 + (xmmRegisterDest & 7) * 8 + (xmmRegisterSrc & 7));
++}
++
++void x64Gen_addss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc) { x64Gen_ssOp_xmmReg_xmmReg(x64GenContext, xmmRegisterDest, xmmRegisterSrc, 0x58); }
++void x64Gen_mulss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc) { x64Gen_ssOp_xmmReg_xmmReg(x64GenContext, xmmRegisterDest, xmmRegisterSrc, 0x59); }
++void x64Gen_subss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc) { x64Gen_ssOp_xmmReg_xmmReg(x64GenContext, xmmRegisterDest, xmmRegisterSrc, 0x5C); }
++void x64Gen_divss_xmmReg_xmmReg(x64GenContext_t* x64GenContext, sint32 xmmRegisterDest, sint32 xmmRegisterSrc) { x64Gen_ssOp_xmmReg_xmmReg(x64GenContext, xmmRegisterDest, xmmRegisterSrc, 0x5E); }
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IML.h b/src/Cafe/HW/Espresso/Recompiler/IML/IML.h
+index ea27e2c..deb85cf 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IML.h
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IML.h
+@@ -10,6 +10,7 @@ void PPCRecompiler_optimizePSQLoadAndStore(struct ppcImlGenContext_t* ppcImlGenC
+ 
+ void IMLOptimizer_StandardOptimizationPass(ppcImlGenContext_t& ppcImlGenContext);
+ void IMLOptimizer_OptimizeSinglePrecisionStores(ppcImlGenContext_t& ppcImlGenContext);
++void IMLOptimizer_SinglePrecisionArithmetic(ppcImlGenContext_t& ppcImlGenContext); // Crema
+ 
+ // debug
+ void IMLDebug_DisassembleInstruction(const IMLInstruction& inst, std::string& disassemblyLineOut);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
+index 94d5e1a..5edc2c7 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLDebug.cpp
+@@ -48,6 +48,24 @@ const char* IMLDebug_GetOpcodeName(const IMLInstruction* iml)
+ 		return "FDIV";
+ 	else if (op == PPCREC_IML_OP_FPR_EXPAND_F32_TO_F64)
+ 		return "F32TOF64";
++	else if (op == PPCREC_IML_OP_FPR_ADD_F32)
++		return "FADDS";
++	else if (op == PPCREC_IML_OP_FPR_SUB_F32)
++		return "FSUBS";
++	else if (op == PPCREC_IML_OP_FPR_MULTIPLY_F32)
++		return "FMULS";
++	else if (op == PPCREC_IML_OP_FPR_DIVIDE_F32)
++		return "FDIVS";
++	else if (op == PPCREC_IML_OP_FPR_ROUND_TO_F32)
++		return "F64TOF32";
++	else if (op == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM)
++		return "FROUND";
++	else if (op == PPCREC_IML_OP_FPR_NEGATE_F32)
++		return "FNEGS";
++	else if (op == PPCREC_IML_OP_FPR_ABS_F32)
++		return "FABSS";
++	else if (op == PPCREC_IML_OP_FPR_NEGATIVE_ABS_F32)
++		return "FNABSS";
+ 	else if (op == PPCREC_IML_OP_FPR_ABS)
+ 		return "FABS";
+ 	else if (op == PPCREC_IML_OP_FPR_NEGATE)
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
+index 997de4e..c500ee6 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.cpp
+@@ -269,7 +269,11 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
+ 		else if (operation == PPCREC_IML_OP_FPR_MULTIPLY ||
+ 			operation == PPCREC_IML_OP_FPR_DIVIDE ||
+ 			operation == PPCREC_IML_OP_FPR_ADD ||
+-			operation == PPCREC_IML_OP_FPR_SUB)
++			operation == PPCREC_IML_OP_FPR_SUB ||
++			operation == PPCREC_IML_OP_FPR_MULTIPLY_F32 ||
++			operation == PPCREC_IML_OP_FPR_DIVIDE_F32 ||
++			operation == PPCREC_IML_OP_FPR_ADD_F32 ||
++			operation == PPCREC_IML_OP_FPR_SUB_F32)
+ 		{
+ 			registersUsed->readGPR1 = op_fpr_r_r.regA;
+ 			registersUsed->readGPR2 = op_fpr_r_r.regR;
+@@ -308,7 +312,11 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
+ 			operation == PPCREC_IML_OP_FPR_ABS ||
+ 			operation == PPCREC_IML_OP_FPR_NEGATIVE_ABS ||
+ 			operation == PPCREC_IML_OP_FPR_EXPAND_F32_TO_F64 ||
+-			operation == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM)
++			operation == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM ||
++			operation == PPCREC_IML_OP_FPR_ROUND_TO_F32 ||
++			operation == PPCREC_IML_OP_FPR_NEGATE_F32 ||
++			operation == PPCREC_IML_OP_FPR_ABS_F32 ||
++			operation == PPCREC_IML_OP_FPR_NEGATIVE_ABS_F32)
+ 		{
+ 			registersUsed->readGPR1 = op_fpr_r.regR;
+ 			registersUsed->writtenGPR1 = op_fpr_r.regR;
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
+index 5ab3ac0..aa69e72 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLInstruction.h
+@@ -139,6 +139,15 @@ enum
+ 	PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM, // round 64bit double to 64bit double with 32bit float precision (in bottom half of xmm register)
+ 	PPCREC_IML_OP_FPR_FCTIWZ,
+ 	PPCREC_IML_OP_FPR_SELECT, // selectively copy bottom value from operand B or C based on value in operand A
++	// Crema: single precision on raw f32 values in the bottom 32 bits (IMLOptimizer_SinglePrecisionArithmetic)
++	PPCREC_IML_OP_FPR_ADD_F32,
++	PPCREC_IML_OP_FPR_SUB_F32,
++	PPCREC_IML_OP_FPR_MULTIPLY_F32,
++	PPCREC_IML_OP_FPR_DIVIDE_F32,
++	PPCREC_IML_OP_FPR_ROUND_TO_F32, // round the bottom double to a raw f32 (cvtsd2ss)
++	PPCREC_IML_OP_FPR_NEGATE_F32,
++	PPCREC_IML_OP_FPR_ABS_F32,
++	PPCREC_IML_OP_FPR_NEGATIVE_ABS_F32,
+ 	// Conversion (FPR_R_R)
+ 	PPCREC_IML_OP_FPR_INT_TO_FLOAT, // convert integer value in gpr to floating point value in fpr
+ 	PPCREC_IML_OP_FPR_FLOAT_TO_INT, // convert floating point value in fpr to integer value in gpr
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLOptimizer.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLOptimizer.cpp
+index ba7101b..7a876d1 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLOptimizer.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLOptimizer.cpp
+@@ -880,3 +880,431 @@ void IMLOptimizer_OptimizeSinglePrecisionStores(ppcImlGenContext_t& ppcImlGenCon
+ 		}
+ 	}
+ }
++
++// Crema: single precision arithmetic on raw f32 values.
++// A single precision instruction is generated as a double operation followed by
++// ROUND_TO_SINGLE_PRECISION_BOTTOM (cvtsd2ss + cvtss2sd, 7 cycles of latency each on Jaguar), and
++// lfs expands every float to a double. Here a register may instead hold its value as a raw f32 in
++// the bottom 32 bits: single loads skip the expansion, a round becomes a single cvtsd2ss, sign
++// operations use f32 masks, and add/sub/mul/div whose operands are raw f32 and whose result only
++// feeds the round run as addss/subss/mulss/divss. Double rounding is innocuous for +, -, * and /
++// (53 >= 2*24+2) and the guest MXCSR flushes the same tiny results either way (FTZ, no DAZ), so the
++// values are bit identical. A raw f32 is expanded right before anything that reads it as a double,
++// before calls and exits, and at the end of a segment when a later segment can read it, so the
++// rest of the recompiler and the interpreter only ever see doubles.
++bool g_crema_fp32 = false;
++
++namespace
++{
++	enum class IMLSPKind : uint8
++	{
++		Double,
++		Raw, // single load, round, or sign operation on a raw f32: held as a raw f32
++		Op, // add/sub/mul/div: raw f32 when its operands are raw and only rounds read its result
++	};
++
++	struct IMLSPValue
++	{
++		IMLSPKind kind;
++		bool operandsRaw;
++		bool otherUse;
++		bool rounded;
++	};
++
++	bool IMLSP_IsSimpleOp(const IMLInstruction& inst)
++	{
++		if (inst.type != PPCREC_IML_TYPE_FPR_R_R && inst.type != PPCREC_IML_TYPE_FPR_R_R_R)
++			return false;
++		return inst.operation == PPCREC_IML_OP_FPR_ADD || inst.operation == PPCREC_IML_OP_FPR_SUB ||
++			inst.operation == PPCREC_IML_OP_FPR_MULTIPLY || inst.operation == PPCREC_IML_OP_FPR_DIVIDE;
++	}
++
++	sint32 IMLSP_F32Operation(sint32 operation)
++	{
++		switch (operation)
++		{
++		case PPCREC_IML_OP_FPR_ADD: return PPCREC_IML_OP_FPR_ADD_F32;
++		case PPCREC_IML_OP_FPR_SUB: return PPCREC_IML_OP_FPR_SUB_F32;
++		case PPCREC_IML_OP_FPR_MULTIPLY: return PPCREC_IML_OP_FPR_MULTIPLY_F32;
++		case PPCREC_IML_OP_FPR_DIVIDE: return PPCREC_IML_OP_FPR_DIVIDE_F32;
++		case PPCREC_IML_OP_FPR_NEGATE: return PPCREC_IML_OP_FPR_NEGATE_F32;
++		case PPCREC_IML_OP_FPR_ABS: return PPCREC_IML_OP_FPR_ABS_F32;
++		case PPCREC_IML_OP_FPR_NEGATIVE_ABS: return PPCREC_IML_OP_FPR_NEGATIVE_ABS_F32;
++		}
++		cemu_assert_suspicious();
++		return operation;
++	}
++
++	bool IMLSP_IsSignOp(const IMLInstruction& inst)
++	{
++		return inst.type == PPCREC_IML_TYPE_FPR_R && (inst.operation == PPCREC_IML_OP_FPR_NEGATE ||
++			inst.operation == PPCREC_IML_OP_FPR_ABS || inst.operation == PPCREC_IML_OP_FPR_NEGATIVE_ABS);
++	}
++
++	// leaves recompiled code (or may: cycle check), so every guest FPR must be a double in hCPU
++	bool IMLSP_IsExit(const IMLInstruction& inst)
++	{
++		return (inst.type == PPCREC_IML_TYPE_MACRO && inst.operation != PPCREC_IML_MACRO_COUNT_CYCLES) ||
++			inst.type == PPCREC_IML_TYPE_CJUMP_CYCLE_CHECK;
++	}
++
++	void IMLSP_GetOperands(const IMLInstruction& inst, IMLReg& r, IMLReg& a, IMLReg& b)
++	{
++		if (inst.type == PPCREC_IML_TYPE_FPR_R_R)
++		{
++			r = inst.op_fpr_r_r.regR;
++			a = inst.op_fpr_r_r.regR;
++			b = inst.op_fpr_r_r.regA;
++		}
++		else
++		{
++			r = inst.op_fpr_r_r_r.regR;
++			a = inst.op_fpr_r_r_r.regA;
++			b = inst.op_fpr_r_r_r.regB;
++		}
++	}
++}
++
++void IMLOptimizer_SinglePrecisionArithmetic(ppcImlGenContext_t& ppcImlGenContext)
++{
++	using Bits = boost::dynamic_bitset<uint64>;
++	auto& segments = ppcImlGenContext.segmentList2;
++	const size_t regCount = static_cast<size_t>(ppcImlGenContext.GetMaxRegId()) + 1;
++	// guest FPRs are live wherever recompiled code is left; the temporaries never are
++	std::vector<bool> isFPR(regCount, false);
++	Bits exitLive(regCount);
++	bool anyCandidate = false;
++	for (auto& it : ppcImlGenContext.mappedRegs)
++	{
++		const IMLRegID id = it.second.GetRegID();
++		if (id >= regCount || it.second.GetBaseFormat() != IMLRegFormat::F64)
++			continue;
++		isFPR[id] = true;
++		if (!(it.first >= PPCREC_NAME_TEMPORARY_FPR0 && it.first < PPCREC_NAME_TEMPORARY_FPR0 + 8))
++			exitLive.set(id);
++	}
++	for (auto* seg : segments)
++	{
++		for (auto& inst : seg->imlList)
++		{
++			anyCandidate |= (inst.type == PPCREC_IML_TYPE_FPR_LOAD || inst.type == PPCREC_IML_TYPE_FPR_LOAD_INDEXED) && inst.op_storeLoad.mode == PPCREC_FPR_LD_MODE_SINGLE;
++			anyCandidate |= inst.type == PPCREC_IML_TYPE_FPR_R && inst.operation == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM;
++		}
++	}
++	if (!anyCandidate)
++		return;
++	auto isFprReg = [&](IMLReg reg) { return reg.IsValid() && reg.GetBaseFormat() == IMLRegFormat::F64 && reg.GetRegID() < regCount; };
++
++	// FPR liveness at the end of every segment
++	const size_t segCount = segments.size();
++	std::vector<Bits> use(segCount, Bits(regCount)), def(segCount, Bits(regCount)), liveIn(segCount, Bits(regCount)), liveOut(segCount, Bits(regCount));
++	std::vector<bool> exits(segCount, false);
++	for (size_t s = 0; s < segCount; s++)
++	{
++		segments[s]->momentaryIndex = static_cast<sint32>(s);
++		for (auto& inst : segments[s]->imlList)
++		{
++			if (IMLSP_IsExit(inst))
++			{
++				// everything not yet defined here is read by whoever runs next
++				use[s] |= exitLive - def[s];
++				exits[s] = true;
++			}
++			IMLUsedRegisters used;
++			inst.CheckRegisterUsage(&used);
++			used.ForEachReadGPR([&](IMLReg reg) { if (isFprReg(reg) && !def[s].test(reg.GetRegID())) use[s].set(reg.GetRegID()); });
++			used.ForEachWrittenGPR([&](IMLReg reg) { if (isFprReg(reg)) def[s].set(reg.GetRegID()); });
++		}
++		exits[s] = exits[s] || segments[s]->nextSegmentIsUncertain || (!segments[s]->nextSegmentBranchNotTaken && !segments[s]->nextSegmentBranchTaken);
++	}
++	for (bool changed = true; changed;)
++	{
++		changed = false;
++		for (size_t s = segCount; s-- > 0;)
++		{
++			IMLSegment* seg = segments[s];
++			Bits out(regCount);
++			if (exits[s])
++				out = exitLive;
++			for (IMLSegment* next : {seg->nextSegmentBranchNotTaken, seg->nextSegmentBranchTaken})
++				if (next)
++					out |= liveIn[next->momentaryIndex];
++			Bits in = use[s] | (out - def[s]);
++			if (in != liveIn[s] || out != liveOut[s])
++			{
++				liveIn[s] = std::move(in);
++				liveOut[s] = std::move(out);
++				changed = true;
++			}
++		}
++	}
++
++	std::vector<sint32> regValue(regCount);
++	std::vector<IMLSPValue> values;
++	std::vector<sint32> instValue;
++	std::vector<uint8> raw(regCount), unsanitized(regCount);
++	std::vector<sint32> aliasOf(regCount);
++	std::vector<uint32> version(regCount), aliasVersion(regCount);
++	std::vector<IMLRegID> rawRegs;
++	std::vector<IMLInstruction> out;
++	for (size_t s = 0; s < segCount; s++)
++	{
++		IMLSegment* seg = segments[s];
++		auto& list = seg->imlList;
++
++		// 1) value numbering: which add/sub/mul/div results only feed rounds
++		std::fill(regValue.begin(), regValue.end(), -1);
++		values.clear();
++		instValue.assign(list.size(), -1);
++		auto otherUse = [&](IMLReg reg) {
++			if (isFprReg(reg) && regValue[reg.GetRegID()] >= 0)
++				values[regValue[reg.GetRegID()]].otherUse = true;
++		};
++		auto isRawValue = [&](IMLReg reg) {
++			const sint32 v = regValue[reg.GetRegID()];
++			return v >= 0 && values[v].kind == IMLSPKind::Raw;
++		};
++		auto define = [&](IMLReg reg, IMLSPKind kind, bool operandsRaw) {
++			values.push_back({kind, operandsRaw, false, false});
++			regValue[reg.GetRegID()] = static_cast<sint32>(values.size()) - 1;
++			return regValue[reg.GetRegID()];
++		};
++		auto markLive = [&](const Bits& live) {
++			for (size_t r = 0; r < regCount; r++)
++				if (regValue[r] >= 0 && live.test(r))
++					values[regValue[r]].otherUse = true;
++		};
++		for (size_t i = 0; i < list.size(); i++)
++		{
++			IMLInstruction& inst = list[i];
++			if (inst.type == PPCREC_IML_TYPE_NO_OP)
++				continue;
++			if (IMLSP_IsExit(inst))
++				markLive(exitLive);
++			else if (inst.type == PPCREC_IML_TYPE_CALL_IMM)
++				markLive(Bits(regCount).set());
++			if (inst.type == PPCREC_IML_TYPE_FPR_LOAD || inst.type == PPCREC_IML_TYPE_FPR_LOAD_INDEXED)
++				define(inst.op_storeLoad.registerData, inst.op_storeLoad.mode == PPCREC_FPR_LD_MODE_SINGLE ? IMLSPKind::Raw : IMLSPKind::Double, false);
++			else if (inst.type == PPCREC_IML_TYPE_FPR_STORE || inst.type == PPCREC_IML_TYPE_FPR_STORE_INDEXED)
++				otherUse(inst.op_storeLoad.registerData); // a store converts the unrounded double
++			else if (inst.type == PPCREC_IML_TYPE_FPR_R_R && inst.operation == PPCREC_IML_OP_FPR_ASSIGN)
++				regValue[inst.op_fpr_r_r.regR.GetRegID()] = regValue[inst.op_fpr_r_r.regA.GetRegID()];
++			else if (inst.type == PPCREC_IML_TYPE_FPR_R && inst.operation == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM)
++			{
++				const sint32 v = regValue[inst.op_fpr_r.regR.GetRegID()];
++				if (v >= 0)
++					values[v].rounded = true;
++				define(inst.op_fpr_r.regR, IMLSPKind::Raw, false);
++			}
++			else if (inst.type == PPCREC_IML_TYPE_FPR_R && inst.operation == PPCREC_IML_OP_FPR_EXPAND_F32_TO_F64)
++				; // only a representation change (OptimizeDirectFloatCopies), managed below
++			else if (IMLSP_IsSignOp(inst))
++			{
++				const bool rawInput = isRawValue(inst.op_fpr_r.regR);
++				otherUse(inst.op_fpr_r.regR);
++				define(inst.op_fpr_r.regR, rawInput ? IMLSPKind::Raw : IMLSPKind::Double, false);
++			}
++			else if (IMLSP_IsSimpleOp(inst))
++			{
++				IMLReg r, a, b;
++				IMLSP_GetOperands(inst, r, a, b);
++				const bool operandsRaw = isRawValue(a) && isRawValue(b);
++				otherUse(a);
++				otherUse(b);
++				instValue[i] = define(r, IMLSPKind::Op, operandsRaw);
++			}
++			else
++			{
++				IMLUsedRegisters used;
++				inst.CheckRegisterUsage(&used);
++				used.ForEachReadGPR(otherUse);
++				used.ForEachWrittenGPR([&](IMLReg reg) { if (isFprReg(reg)) define(reg, IMLSPKind::Double, false); });
++			}
++		}
++		markLive(liveOut[s]);
++		auto isF32Op = [&](size_t i) {
++			if (instValue[i] < 0)
++				return false;
++			const IMLSPValue& v = values[instValue[i]];
++			return v.operandsRaw && v.rounded && !v.otherUse;
++		};
++
++		// 2) rewrite, tracking which registers hold a raw f32 right now
++		std::fill(raw.begin(), raw.end(), 0);
++		std::fill(unsanitized.begin(), unsanitized.end(), 0);
++		std::fill(aliasOf.begin(), aliasOf.end(), -1);
++		rawRegs.clear();
++		out.clear();
++		out.reserve(list.size() + 16);
++		auto emit = [&](auto make) {
++			IMLInstruction inst{};
++			make(inst);
++			out.push_back(inst);
++		};
++		auto written = [&](IMLReg reg, bool isRaw, bool isUnsanitized) {
++			const IMLRegID id = reg.GetRegID();
++			raw[id] = isRaw;
++			unsanitized[id] = isRaw && isUnsanitized;
++			version[id]++;
++			aliasOf[id] = -1;
++			if (isRaw)
++				rawRegs.push_back(id);
++		};
++		// a raw copy of a register that is a double again becomes a move instead of a conversion
++		auto canMove = [&](IMLRegID id) {
++			const sint32 src = aliasOf[id];
++			return src >= 0 && !raw[src] && version[src] == aliasVersion[id];
++		};
++		auto expand = [&](IMLRegID id) {
++			if (canMove(id))
++				emit([&](IMLInstruction& n) { n.make_fpr_r_r(PPCREC_IML_OP_FPR_ASSIGN, _FPRRegFromID(id), _FPRRegFromID(aliasOf[id])); });
++			else
++				emit([&](IMLInstruction& n) { n.make_fpr_r(PPCREC_IML_OP_FPR_EXPAND_F32_TO_F64, _FPRRegFromID(id)); });
++			raw[id] = 0;
++			unsanitized[id] = 0;
++		};
++		auto readDouble = [&](IMLReg reg) {
++			if (isFprReg(reg) && raw[reg.GetRegID()])
++				expand(reg.GetRegID());
++		};
++		auto expandLive = [&](const Bits* live) {
++			// copies whose source is a double already first, then the others (sources before copies)
++			for (bool progress = true; progress;)
++			{
++				progress = false;
++				for (IMLRegID id : rawRegs)
++				{
++					if (raw[id] && (!live || live->test(id)) && canMove(id))
++					{
++						expand(id);
++						progress = true;
++					}
++				}
++				if (progress)
++					continue;
++				sint32 pick = -1;
++				for (IMLRegID id : rawRegs)
++				{
++					if (raw[id] && (!live || live->test(id)) && (pick < 0 || aliasOf[pick] >= 0))
++						pick = static_cast<sint32>(id);
++				}
++				if (pick >= 0)
++				{
++					expand(static_cast<IMLRegID>(pick));
++					progress = true;
++				}
++			}
++			std::erase_if(rawRegs, [&](IMLRegID id) { return !raw[id]; });
++		};
++		auto generic = [&](IMLInstruction& inst) {
++			IMLUsedRegisters used;
++			inst.CheckRegisterUsage(&used);
++			used.ForEachReadGPR(readDouble);
++			out.push_back(inst);
++			used.ForEachWrittenGPR([&](IMLReg reg) { if (isFprReg(reg)) written(reg, false, false); });
++		};
++		bool endsWithSuffix = false;
++		for (size_t i = 0; i < list.size(); i++)
++		{
++			IMLInstruction inst = list[i];
++			if (inst.type == PPCREC_IML_TYPE_NO_OP)
++			{
++				out.push_back(inst);
++				continue;
++			}
++			if (IMLSP_IsExit(inst))
++				expandLive(&exitLive);
++			else if (inst.type == PPCREC_IML_TYPE_CALL_IMM)
++				expandLive(nullptr);
++			if (inst.IsSuffixInstruction())
++			{
++				expandLive(&liveOut[s]);
++				endsWithSuffix = true;
++				generic(inst);
++				continue;
++			}
++			if (inst.type == PPCREC_IML_TYPE_FPR_LOAD || inst.type == PPCREC_IML_TYPE_FPR_LOAD_INDEXED)
++			{
++				const bool single = inst.op_storeLoad.mode == PPCREC_FPR_LD_MODE_SINGLE;
++				if (single)
++					inst.op_storeLoad.flags2.notExpanded = true;
++				out.push_back(inst);
++				written(inst.op_storeLoad.registerData, single, true);
++			}
++			else if ((inst.type == PPCREC_IML_TYPE_FPR_STORE || inst.type == PPCREC_IML_TYPE_FPR_STORE_INDEXED) &&
++				(inst.op_storeLoad.mode == PPCREC_FPR_ST_MODE_SINGLE || inst.op_storeLoad.mode == PPCREC_FPR_ST_MODE_SINGLE_FTZ))
++			{
++				// a raw f32 is stored as it is (like OptimizeDirectFloatCopies does for load+store)
++				inst.op_storeLoad.flags2.notExpanded = raw[inst.op_storeLoad.registerData.GetRegID()] != 0;
++				out.push_back(inst);
++			}
++			else if (inst.type == PPCREC_IML_TYPE_FPR_R && inst.operation == PPCREC_IML_OP_FPR_EXPAND_F32_TO_F64)
++				; // representation is tracked here: expanded when needed
++			else if (inst.type == PPCREC_IML_TYPE_FPR_R && inst.operation == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM)
++			{
++				const IMLRegID id = inst.op_fpr_r.regR.GetRegID();
++				if (raw[id] && !unsanitized[id])
++					continue; // already an f32 that rounding leaves as it is
++				if (raw[id])
++					expand(id); // a loaded denormal or signaling NaN: round it the usual way
++				inst.operation = PPCREC_IML_OP_FPR_ROUND_TO_F32;
++				out.push_back(inst);
++				written(inst.op_fpr_r.regR, true, false);
++			}
++			else if (IMLSP_IsSignOp(inst) && raw[inst.op_fpr_r.regR.GetRegID()])
++			{
++				const bool wasUnsanitized = unsanitized[inst.op_fpr_r.regR.GetRegID()] != 0;
++				inst.operation = IMLSP_F32Operation(inst.operation);
++				out.push_back(inst);
++				written(inst.op_fpr_r.regR, true, wasUnsanitized);
++			}
++			else if (inst.type == PPCREC_IML_TYPE_FPR_R_R && inst.operation == PPCREC_IML_OP_FPR_ASSIGN)
++			{
++				const IMLRegID r = inst.op_fpr_r_r.regR.GetRegID();
++				const IMLRegID a = inst.op_fpr_r_r.regA.GetRegID();
++				out.push_back(inst);
++				if (r == a)
++					continue;
++				const bool rawSource = raw[a] != 0;
++				written(inst.op_fpr_r_r.regR, rawSource, unsanitized[a] != 0);
++				if (rawSource)
++				{
++					// remember the root, so copies of copies can still become moves
++					const bool chained = aliasOf[a] >= 0 && version[aliasOf[a]] == aliasVersion[a];
++					aliasOf[r] = chained ? aliasOf[a] : static_cast<sint32>(a);
++					aliasVersion[r] = version[aliasOf[r]];
++				}
++			}
++			else if (IMLSP_IsSimpleOp(inst))
++			{
++				IMLReg r, a, b;
++				IMLSP_GetOperands(inst, r, a, b);
++				if (isF32Op(i) && raw[a.GetRegID()] && raw[b.GetRegID()])
++				{
++					inst.operation = IMLSP_F32Operation(inst.operation);
++					out.push_back(inst);
++					written(r, true, false);
++				}
++				else
++				{
++					readDouble(a);
++					readDouble(b);
++					out.push_back(inst);
++					if (isF32Op(i))
++					{
++						// its rounds are gone: round right here instead
++						emit([&](IMLInstruction& n) { n.make_fpr_r(PPCREC_IML_OP_FPR_ROUND_TO_F32, r); });
++						written(r, true, false);
++					}
++					else
++						written(r, false, false);
++				}
++			}
++			else
++				generic(inst);
++		}
++		if (!endsWithSuffix)
++			expandLive(&liveOut[s]);
++		list.swap(out);
++	}
++}
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 index 935e61a..ab30a9b 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
@@ -699,7 +1341,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..0dff409 100644
+index c9758f3..685ec29 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1142,7 +1784,7 @@ index c9758f3..0dff409 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +720,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +720,143 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -1154,6 +1796,7 @@ index c9758f3..0dff409 100644
 +// leaves the function every bit is live, except that a call (bl, bctrl, an HLE call) leaves cr0,
 +// cr1 and cr5-cr7 dead: the PowerPC EABI makes those fields volatile.
 +bool g_crema_fast_compares = true;
++extern bool g_crema_fp32; // IML/IMLOptimizer.cpp: single precision arithmetic on raw f32 values
 +
 +static void PPCRecompiler_RemoveDeadCRWrites(ppcImlGenContext_t& ctx)
 +{
@@ -1285,7 +1928,7 @@ index c9758f3..0dff409 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +867,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +868,28 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -1298,6 +1941,12 @@ index c9758f3..0dff409 100644
  
  	IMLOptimizer_OptimizeSinglePrecisionStores(ppcImlGenContext);
  
++#ifdef ARCH_X86_64
++	// Crema: raw f32 values for single precision arithmetic (Crema Live: set fp32 0/1)
++	if (g_crema_fp32)
++		IMLOptimizer_SinglePrecisionArithmetic(ppcImlGenContext);
++#endif
++
 +#ifdef __ORBIS__
 +	const uint64 regallocStart = CremaThreadCpuNs();
 +#endif
@@ -1308,7 +1957,7 @@ index c9758f3..0dff409 100644
  
  	return true;
  }
-@@ -377,6 +904,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +911,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -1317,7 +1966,7 @@ index c9758f3..0dff409 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +917,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +924,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1334,7 +1983,7 @@ index c9758f3..0dff409 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +956,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +963,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1344,7 +1993,7 @@ index c9758f3..0dff409 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +983,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +990,117 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1466,7 +2115,7 @@ index c9758f3..0dff409 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1126,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1133,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1550,7 +2199,7 @@ index c9758f3..0dff409 100644
  	}
  }
  
-@@ -504,6 +1215,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1222,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1592,7 +2241,7 @@ index c9758f3..0dff409 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1355,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1362,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1600,7 +2249,39 @@ index c9758f3..0dff409 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1449,11 @@ void PPCRecompiler_init()
+@@ -655,6 +1409,15 @@ void PPCRecompiler_initPlatform()
+ 	ppcRecompilerInstanceData->_x64XMM_mxCsr_ftzOn = 0x1F80 | 0x8000;
+ 	ppcRecompilerInstanceData->_x64XMM_mxCsr_ftzOff = 0x1F80;
+ 	ppcRecompilerInstanceData->_x64_pextSingleMask = 0xC7FFFFFFE0000000ULL; // sign, exponent bit 62, then bits 58-29
++	// Crema: raw f32 sign masks (IMLOptimizer_SinglePrecisionArithmetic)
++	ppcRecompilerInstanceData->_x64XMM_xorNegateMaskBottomF32[0] = 0x80000000;
++	ppcRecompilerInstanceData->_x64XMM_xorNegateMaskBottomF32[1] = 0;
++	ppcRecompilerInstanceData->_x64XMM_xorNegateMaskBottomF32[2] = 0;
++	ppcRecompilerInstanceData->_x64XMM_xorNegateMaskBottomF32[3] = 0;
++	ppcRecompilerInstanceData->_x64XMM_andAbsMaskBottomF32[0] = 0x7FFFFFFF;
++	ppcRecompilerInstanceData->_x64XMM_andAbsMaskBottomF32[1] = ~0u;
++	ppcRecompilerInstanceData->_x64XMM_andAbsMaskBottomF32[2] = ~0u;
++	ppcRecompilerInstanceData->_x64XMM_andAbsMaskBottomF32[3] = ~0u;
+ }
+ #else
+ void PPCRecompiler_initPlatform()
+@@ -666,6 +1429,15 @@ void PPCRecompiler_initPlatform()
+ void PPCRecompiler_init()
+ {
+ 	s_ppcRecompilerState.recompilerEnableCount = 0;
++#ifdef __ORBIS__
++	// Crema experiment: /data/Crema/fp32.txt holding "1" (Crema Live: set fp32 0/1, then inval)
++	if (FILE* f = fopen("/data/Crema/fp32.txt", "rb"))
++	{
++		g_crema_fp32 = fgetc(f) == '1';
++		fclose(f);
++		cemuLog_log(LogType::Force, "Recompiler: single precision on raw f32 values {} (/data/Crema/fp32.txt)", g_crema_fp32 ? "on" : "off");
++	}
++#endif
+ 	if (ActiveSettings::GetCPUMode() == CPUMode::SinglecoreInterpreter)
+ 	{
+ 		cemuLog_log(LogType::Force, "Using singlecore interpreter");
+@@ -702,7 +1474,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1613,7 +2294,7 @@ index c9758f3..0dff409 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1462,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1487,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -1630,6 +2311,20 @@ index c9758f3..0dff409 100644
      // clean up queues
      while(!s_ppcRecompilerState.targetQueue.empty())
          s_ppcRecompilerState.targetQueue.pop();
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.h b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.h
+index 3e9a794..20b3195 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.h
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.h
+@@ -150,6 +150,9 @@ typedef struct
+ 	uint32 _x64XMM_mxCsr_ftzOff;
+ 	// PEXT mask
+ 	uint64 _x64_pextSingleMask;
++	// Crema: sign masks for a raw f32 in the bottom 32 bits
++	alignas(16) uint32 _x64XMM_xorNegateMaskBottomF32[4];
++	alignas(16) uint32 _x64XMM_andAbsMaskBottomF32[4];
+ }PPCRecompilerInstanceData_t;
+ 
+ extern PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
 index bfb2aed..66c27a0 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
@@ -6090,10 +6785,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..fb2a828
+index 0000000..fa229ae
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,526 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -6146,6 +6841,7 @@ index 0000000..fb2a828
 +#include <vector>
 +
 +extern bool g_crema_fast_cycles; // Recompiler/PPCRecompilerImlGen.cpp
++extern bool g_crema_fp32; // Recompiler/IML/IMLOptimizer.cpp
 +extern bool g_crema_cl_shifts; // Recompiler/BackendX64/BackendX64.cpp
 +extern bool g_crema_fast_compares; // Recompiler/PPCRecompiler.cpp
 +extern std::atomic<uint64> g_crema_ra_budget; // Recompiler/IML/IMLRegisterAllocator.cpp
@@ -6195,10 +6891,10 @@ index 0000000..fb2a828
 +	std::string Values()
 +	{
 +		char line[256];
-+		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d latte_slow=%u vk_thread=%d prof=%d",
++		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d latte_slow=%u vk_thread=%d prof=%d fp32=%d",
 +			g_crema_fast_cycles ? 1 : 0, g_crema_cl_shifts ? 1 : 0, g_crema_fast_compares ? 1 : 0,
 +			(unsigned long long)g_crema_ra_budget.load(), (int)g_crema_ra_scan.load(), ppcThreadQuantum,
-+			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, g_crema_latte_slow.load(), CremaVkRecorder_Deferred() ? 1 : 0, s_profilerOn.load() ? 1 : 0);
++			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, g_crema_latte_slow.load(), CremaVkRecorder_Deferred() ? 1 : 0, s_profilerOn.load() ? 1 : 0, g_crema_fp32 ? 1 : 0);
 +		return line;
 +	}
 +
@@ -6221,6 +6917,8 @@ index 0000000..fb2a828
 +			coreinit::g_crema_thread_fairness = number != 0;
 +		else if (name == "count_branches")
 +			g_crema_count_branches = number != 0;
++		else if (name == "fp32")
++			g_crema_fp32 = number != 0;
 +		else if (name == "latte_slow" && number <= 200)
 +			g_crema_latte_slow = (uint32)number;
 +		else if (name == "hostlayout" && (value == "float" || value == "pinned"))
