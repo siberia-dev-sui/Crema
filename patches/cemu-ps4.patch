@@ -63,7 +63,7 @@ index d8378c3..a27c3df 100644
 +	ps4_add_eboot(CemuBin)
 +endif()
 diff --git a/src/Cafe/CMakeLists.txt b/src/Cafe/CMakeLists.txt
-index b509e72..22777eb 100644
+index b509e72..d2c396a 100644
 --- a/src/Cafe/CMakeLists.txt
 +++ b/src/Cafe/CMakeLists.txt
 @@ -548,6 +548,10 @@ if (ENABLE_VULKAN)
@@ -71,7 +71,7 @@ index b509e72..22777eb 100644
  endif()
  
 +if(PS4 AND ENABLE_VULKAN)
-+	target_sources(CemuCafe PRIVATE HW/Latte/Renderer/Vulkan/PS4WSI.cpp)
++	target_sources(CemuCafe PRIVATE HW/Latte/Renderer/Vulkan/PS4WSI.cpp HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp)
 +endif()
 +
  if(APPLE)
@@ -3251,11 +3251,791 @@ index 7179087..af4a1d9 100644
  
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp
+new file mode 100644
+index 0000000..eb02fa7
+--- /dev/null
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp
+@@ -0,0 +1,767 @@
++// Crema (PS4): Vulkan command recording on its own thread.
++//
++// The GPU command thread (LatteThread) spends ~40% of its time inside the driver recording
++// commands (RADV's vkCmd*: state emission, descriptors, draws), and it limits the frame rate in
++// Breath of the Wild (slowing it by 15% costs ~11% of the frame rate). With
++// /data/Crema/vkthread.txt holding "1", the device functions that record into or submit command
++// buffers are replaced (they are global function pointers, VulkanAPI.h) by stubs that copy their
++// arguments into a ring buffer, and a recording thread on another core replays them, in order,
++// with the driver's functions. Anything that needs the queue or the recorded work from the CPU
++// side (present, acquire, wait idle) first waits until the recording thread has caught up.
++//
++// Ordering: one producer at a time (a lock), one consumer, records replayed in order. Command
++// buffers, their pool and the queue are only touched by the recording thread while it runs, and
++// by the caller after a drain (the recording thread then waits on an empty ring).
++// Fences: vkGetFenceStatus/vkWaitForFences go straight to the driver; a fence whose submission is
++// still in the ring just isn't signaled yet, and the recording thread submits it without help.
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++#include "Cemu/Logging/CemuLogging.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <thread>
++
++extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp
++extern "C" void ps4_thread_cpu_tick(); // port/ps4_sampler.cpp
++void SetThreadName(const char* name);
++
++namespace
++{
++	struct Real
++	{
++#define CREMA_VK_REAL(fn) PFN_##fn fn = nullptr;
++		CREMA_VK_REAL(vkCmdBeginRenderPass) CREMA_VK_REAL(vkCmdEndRenderPass) CREMA_VK_REAL(vkCmdBindPipeline)
++		CREMA_VK_REAL(vkCmdDraw) CREMA_VK_REAL(vkCmdCopyBufferToImage) CREMA_VK_REAL(vkCmdCopyImageToBuffer)
++		CREMA_VK_REAL(vkCmdClearColorImage) CREMA_VK_REAL(vkCmdClearAttachments) CREMA_VK_REAL(vkCmdBindIndexBuffer)
++		CREMA_VK_REAL(vkCmdBindVertexBuffers) CREMA_VK_REAL(vkCmdDrawIndexed) CREMA_VK_REAL(vkCmdSetViewport)
++		CREMA_VK_REAL(vkCmdSetScissor) CREMA_VK_REAL(vkCmdBindDescriptorSets) CREMA_VK_REAL(vkCmdPipelineBarrier)
++		CREMA_VK_REAL(vkCmdClearDepthStencilImage) CREMA_VK_REAL(vkCmdCopyBuffer) CREMA_VK_REAL(vkCmdCopyImage)
++		CREMA_VK_REAL(vkCmdBlitImage) CREMA_VK_REAL(vkCmdPushConstants) CREMA_VK_REAL(vkCmdSetBlendConstants)
++		CREMA_VK_REAL(vkCmdSetDepthBias) CREMA_VK_REAL(vkCmdPipelineBarrier2KHR) CREMA_VK_REAL(vkCmdBeginRenderingKHR)
++		CREMA_VK_REAL(vkCmdEndRenderingKHR) CREMA_VK_REAL(vkCmdSetAttachmentFeedbackLoopEnableEXT)
++		CREMA_VK_REAL(vkCmdResetQueryPool) CREMA_VK_REAL(vkCmdBeginQuery) CREMA_VK_REAL(vkCmdEndQuery)
++		CREMA_VK_REAL(vkCmdCopyQueryPoolResults) CREMA_VK_REAL(vkCmdSetEvent) CREMA_VK_REAL(vkCmdWaitEvents)
++		CREMA_VK_REAL(vkBeginCommandBuffer) CREMA_VK_REAL(vkEndCommandBuffer) CREMA_VK_REAL(vkResetCommandBuffer)
++		CREMA_VK_REAL(vkQueueSubmit) CREMA_VK_REAL(vkQueueWaitIdle) CREMA_VK_REAL(vkDeviceWaitIdle)
++		CREMA_VK_REAL(vkQueuePresentKHR) CREMA_VK_REAL(vkAcquireNextImageKHR)
++#undef CREMA_VK_REAL
++	} s_real;
++
++	// ---- ring buffer of records: [header][arguments][copied arrays], 16-byte aligned ----
++	struct RecordHeader
++	{
++		void (*replay)(void* args); // nullptr: wrap to the start
++		uint32 size; // whole record, header included
++		uint32 pad;
++	};
++	constexpr size_t kRingSize = 16 * 1024 * 1024;
++	constexpr size_t kMaxRecord = 256 * 1024;
++	uint8* s_ring = nullptr;
++	alignas(64) std::atomic<size_t> s_writePos{0}; // published by the producer
++	alignas(64) std::atomic<size_t> s_readPos{0}; // advanced by the recording thread
++	alignas(64) std::atomic<bool> s_sleeping{false};
++	size_t s_reserveStart = 0; // the record being written (producer only)
++	std::mutex s_producerLock; // one producer at a time
++	std::mutex s_wakeLock;
++	std::condition_variable s_wake;
++	std::atomic<uint64> s_records{0}, s_drains{0};
++
++	inline size_t Align16(size_t n) { return (n + 15) & ~(size_t)15; }
++
++	// Space for a record of `size` bytes (aligned); waits while the ring is full.
++	uint8* Reserve(size_t size)
++	{
++		size = Align16(size);
++		size_t write = s_writePos.load(std::memory_order_relaxed);
++		for (uint32 spins = 0;; spins++)
++		{
++			const size_t read = s_readPos.load(std::memory_order_acquire);
++			const size_t used = (write - read + kRingSize) % kRingSize;
++			const size_t tailRoom = kRingSize - write;
++			const size_t need = size + (tailRoom < size ? tailRoom : 0) + 16; // keep a gap: write == read means empty
++			if (kRingSize - used >= need)
++				break;
++			if (spins < 1000)
++				_mm_pause();
++			else
++				std::this_thread::yield();
++		}
++		if (kRingSize - write < size)
++		{
++			// not enough room before the end: a wrap marker, the record at the start
++			auto* wrap = (RecordHeader*)(s_ring + write);
++			wrap->replay = nullptr;
++			wrap->size = (uint32)(kRingSize - write);
++			write = 0;
++		}
++		s_reserveStart = write;
++		return s_ring + write;
++	}
++
++	void Commit(size_t size)
++	{
++		const size_t next = (s_reserveStart + Align16(size)) % kRingSize;
++		s_writePos.store(next, std::memory_order_seq_cst);
++		s_records.fetch_add(1, std::memory_order_relaxed);
++		if (s_sleeping.load(std::memory_order_seq_cst))
++		{
++			std::lock_guard _l(s_wakeLock);
++			s_wake.notify_one();
++		}
++	}
++
++	// Waits until the recording thread has replayed everything committed so far.
++	void Drain()
++	{
++		const size_t target = s_writePos.load(std::memory_order_acquire);
++		s_drains.fetch_add(1, std::memory_order_relaxed);
++		for (uint32 spins = 0; s_readPos.load(std::memory_order_acquire) != target; spins++)
++		{
++			if (spins < 4000)
++				_mm_pause();
++			else
++				std::this_thread::yield();
++		}
++	}
++
++	void RecordingThread()
++	{
++		SetThreadName("VkRecorder");
++		ps4_boost_thread();
++		size_t read = 0;
++		for (;;)
++		{
++			ps4_thread_cpu_tick();
++			size_t write = s_writePos.load(std::memory_order_acquire);
++			if (read == write)
++			{
++				for (uint32 i = 0; i < 4000 && read == write; i++)
++				{
++					_mm_pause();
++					write = s_writePos.load(std::memory_order_acquire);
++				}
++				if (read == write)
++				{
++					std::unique_lock l(s_wakeLock);
++					s_sleeping.store(true, std::memory_order_seq_cst);
++					s_wake.wait(l, [&] { return s_writePos.load(std::memory_order_seq_cst) != read; });
++					s_sleeping.store(false, std::memory_order_relaxed);
++				}
++				continue;
++			}
++			auto* header = (RecordHeader*)(s_ring + read);
++			if (header->replay)
++				header->replay(header + 1);
++			read = (read + header->size) % kRingSize;
++			s_readPos.store(read, std::memory_order_release);
++		}
++	}
++
++	// ---- argument copies ----
++	struct Writer
++	{
++		uint8* p;
++		template<typename T>
++		const T* Array(const T* src, size_t count)
++		{
++			if (!src || !count)
++				return nullptr;
++			p = (uint8*)(((uintptr_t)p + alignof(T) - 1) & ~(uintptr_t)(alignof(T) - 1));
++			memcpy(p, src, sizeof(T) * count);
++			const T* copy = (const T*)p;
++			p += sizeof(T) * count;
++			return copy;
++		}
++	};
++	template<typename T> constexpr size_t ArraySize(size_t count) { return count ? sizeof(T) * count + alignof(T) : 0; }
++
++	// A record whose arguments are `Args` plus `extra` bytes of copied arrays. The producer lock
++	// is held from Begin to End.
++	template<typename Args>
++	struct Rec
++	{
++		Args* args;
++		Writer extra;
++		size_t size;
++		Rec(void (*replay)(Args*), size_t extraBytes)
++		{
++			s_producerLock.lock();
++			size = sizeof(RecordHeader) + sizeof(Args) + extraBytes;
++			if (size > kMaxRecord)
++				cemuLog_log(LogType::Force, "VkRecorder: record of {} bytes", size);
++			uint8* p = Reserve(size);
++			auto* header = (RecordHeader*)p;
++			header->replay = (void (*)(void*))replay;
++			header->size = (uint32)Align16(size);
++			args = (Args*)(header + 1);
++			extra.p = (uint8*)(args + 1);
++		}
++		~Rec()
++		{
++			Commit(size);
++			s_producerLock.unlock();
++		}
++	};
++
++	// Calls that can't be copied (an unexpected pNext chain): replayed state first, then directly
++	struct DirectCall
++	{
++		DirectCall() { s_producerLock.lock(); Drain(); }
++		~DirectCall() { s_producerLock.unlock(); }
++	};
++
++	// Crema Live ("set vk_thread 0/1"): off, every call goes straight to the driver (after the
++	// recording thread caught up), as without the recorder
++	std::atomic<bool> s_deferred{true};
++#define CREMA_VK_DIRECT(call) if (!s_deferred.load(std::memory_order_relaxed)) { DirectCall d; return call; }
++
++	// ---- the recorded functions ----
++	VKAPI_ATTR void VKAPI_CALL CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo* info, VkSubpassContents contents)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBeginRenderPass(cb, info, contents))
++		if (info->pNext)
++		{
++			DirectCall d;
++			s_real.vkCmdBeginRenderPass(cb, info, contents);
++			return;
++		}
++		struct A { VkCommandBuffer cb; VkRenderPassBeginInfo info; VkSubpassContents contents; };
++		Rec<A> r([](A* a) { s_real.vkCmdBeginRenderPass(a->cb, &a->info, a->contents); }, ArraySize<VkClearValue>(info->clearValueCount));
++		r.args->cb = cb;
++		r.args->info = *info;
++		r.args->info.pClearValues = r.extra.Array(info->pClearValues, info->clearValueCount);
++		r.args->contents = contents;
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdEndRenderPass(VkCommandBuffer cb)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdEndRenderPass(cb))
++		struct A { VkCommandBuffer cb; };
++		Rec<A> r([](A* a) { s_real.vkCmdEndRenderPass(a->cb); }, 0);
++		r.args->cb = cb;
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bindPoint, VkPipeline pipeline)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBindPipeline(cb, bindPoint, pipeline))
++		struct A { VkCommandBuffer cb; VkPipelineBindPoint bindPoint; VkPipeline pipeline; };
++		Rec<A> r([](A* a) { s_real.vkCmdBindPipeline(a->cb, a->bindPoint, a->pipeline); }, 0);
++		*r.args = {cb, bindPoint, pipeline};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdDraw(VkCommandBuffer cb, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdDraw(cb, vertexCount, instanceCount, firstVertex, firstInstance))
++		struct A { VkCommandBuffer cb; uint32_t vertexCount, instanceCount, firstVertex, firstInstance; };
++		Rec<A> r([](A* a) { s_real.vkCmdDraw(a->cb, a->vertexCount, a->instanceCount, a->firstVertex, a->firstInstance); }, 0);
++		*r.args = {cb, vertexCount, instanceCount, firstVertex, firstInstance};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdDrawIndexed(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance))
++		struct A { VkCommandBuffer cb; uint32_t indexCount, instanceCount, firstIndex; int32_t vertexOffset; uint32_t firstInstance; };
++		Rec<A> r([](A* a) { s_real.vkCmdDrawIndexed(a->cb, a->indexCount, a->instanceCount, a->firstIndex, a->vertexOffset, a->firstInstance); }, 0);
++		*r.args = {cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout layout, uint32_t count, const VkBufferImageCopy* regions)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdCopyBufferToImage(cb, src, dst, layout, count, regions))
++		struct A { VkCommandBuffer cb; VkBuffer src; VkImage dst; VkImageLayout layout; uint32_t count; const VkBufferImageCopy* regions; };
++		Rec<A> r([](A* a) { s_real.vkCmdCopyBufferToImage(a->cb, a->src, a->dst, a->layout, a->count, a->regions); }, ArraySize<VkBufferImageCopy>(count));
++		*r.args = {cb, src, dst, layout, count, nullptr};
++		r.args->regions = r.extra.Array(regions, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout layout, VkBuffer dst, uint32_t count, const VkBufferImageCopy* regions)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdCopyImageToBuffer(cb, src, layout, dst, count, regions))
++		struct A { VkCommandBuffer cb; VkImage src; VkImageLayout layout; VkBuffer dst; uint32_t count; const VkBufferImageCopy* regions; };
++		Rec<A> r([](A* a) { s_real.vkCmdCopyImageToBuffer(a->cb, a->src, a->layout, a->dst, a->count, a->regions); }, ArraySize<VkBufferImageCopy>(count));
++		*r.args = {cb, src, layout, dst, count, nullptr};
++		r.args->regions = r.extra.Array(regions, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearColorValue* color, uint32_t count, const VkImageSubresourceRange* ranges)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdClearColorImage(cb, image, layout, color, count, ranges))
++		struct A { VkCommandBuffer cb; VkImage image; VkImageLayout layout; VkClearColorValue color; uint32_t count; const VkImageSubresourceRange* ranges; };
++		Rec<A> r([](A* a) { s_real.vkCmdClearColorImage(a->cb, a->image, a->layout, &a->color, a->count, a->ranges); }, ArraySize<VkImageSubresourceRange>(count));
++		*r.args = {cb, image, layout, *color, count, nullptr};
++		r.args->ranges = r.extra.Array(ranges, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value, uint32_t count, const VkImageSubresourceRange* ranges)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdClearDepthStencilImage(cb, image, layout, value, count, ranges))
++		struct A { VkCommandBuffer cb; VkImage image; VkImageLayout layout; VkClearDepthStencilValue value; uint32_t count; const VkImageSubresourceRange* ranges; };
++		Rec<A> r([](A* a) { s_real.vkCmdClearDepthStencilImage(a->cb, a->image, a->layout, &a->value, a->count, a->ranges); }, ArraySize<VkImageSubresourceRange>(count));
++		*r.args = {cb, image, layout, *value, count, nullptr};
++		r.args->ranges = r.extra.Array(ranges, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdClearAttachments(VkCommandBuffer cb, uint32_t attachmentCount, const VkClearAttachment* attachments, uint32_t rectCount, const VkClearRect* rects)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdClearAttachments(cb, attachmentCount, attachments, rectCount, rects))
++		struct A { VkCommandBuffer cb; uint32_t attachmentCount; const VkClearAttachment* attachments; uint32_t rectCount; const VkClearRect* rects; };
++		Rec<A> r([](A* a) { s_real.vkCmdClearAttachments(a->cb, a->attachmentCount, a->attachments, a->rectCount, a->rects); },
++			ArraySize<VkClearAttachment>(attachmentCount) + ArraySize<VkClearRect>(rectCount));
++		*r.args = {cb, attachmentCount, nullptr, rectCount, nullptr};
++		r.args->attachments = r.extra.Array(attachments, attachmentCount);
++		r.args->rects = r.extra.Array(rects, rectCount);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBindIndexBuffer(cb, buffer, offset, type))
++		struct A { VkCommandBuffer cb; VkBuffer buffer; VkDeviceSize offset; VkIndexType type; };
++		Rec<A> r([](A* a) { s_real.vkCmdBindIndexBuffer(a->cb, a->buffer, a->offset, a->type); }, 0);
++		*r.args = {cb, buffer, offset, type};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkBuffer* buffers, const VkDeviceSize* offsets)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBindVertexBuffers(cb, first, count, buffers, offsets))
++		struct A { VkCommandBuffer cb; uint32_t first, count; const VkBuffer* buffers; const VkDeviceSize* offsets; };
++		Rec<A> r([](A* a) { s_real.vkCmdBindVertexBuffers(a->cb, a->first, a->count, a->buffers, a->offsets); },
++			ArraySize<VkBuffer>(count) + ArraySize<VkDeviceSize>(count));
++		*r.args = {cb, first, count, nullptr, nullptr};
++		r.args->buffers = r.extra.Array(buffers, count);
++		r.args->offsets = r.extra.Array(offsets, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkViewport* viewports)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdSetViewport(cb, first, count, viewports))
++		struct A { VkCommandBuffer cb; uint32_t first, count; const VkViewport* viewports; };
++		Rec<A> r([](A* a) { s_real.vkCmdSetViewport(a->cb, a->first, a->count, a->viewports); }, ArraySize<VkViewport>(count));
++		*r.args = {cb, first, count, nullptr};
++		r.args->viewports = r.extra.Array(viewports, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkRect2D* scissors)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdSetScissor(cb, first, count, scissors))
++		struct A { VkCommandBuffer cb; uint32_t first, count; const VkRect2D* scissors; };
++		Rec<A> r([](A* a) { s_real.vkCmdSetScissor(a->cb, a->first, a->count, a->scissors); }, ArraySize<VkRect2D>(count));
++		*r.args = {cb, first, count, nullptr};
++		r.args->scissors = r.extra.Array(scissors, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, uint32_t firstSet, uint32_t setCount,
++		const VkDescriptorSet* sets, uint32_t dynamicOffsetCount, const uint32_t* dynamicOffsets)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBindDescriptorSets(cb, bindPoint, layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets))
++		struct A { VkCommandBuffer cb; VkPipelineBindPoint bindPoint; VkPipelineLayout layout; uint32_t firstSet, setCount; const VkDescriptorSet* sets; uint32_t dynamicOffsetCount; const uint32_t* dynamicOffsets; };
++		Rec<A> r([](A* a) { s_real.vkCmdBindDescriptorSets(a->cb, a->bindPoint, a->layout, a->firstSet, a->setCount, a->sets, a->dynamicOffsetCount, a->dynamicOffsets); },
++			ArraySize<VkDescriptorSet>(setCount) + ArraySize<uint32_t>(dynamicOffsetCount));
++		*r.args = {cb, bindPoint, layout, firstSet, setCount, nullptr, dynamicOffsetCount, nullptr};
++		r.args->sets = r.extra.Array(sets, setCount);
++		r.args->dynamicOffsets = r.extra.Array(dynamicOffsets, dynamicOffsetCount);
++	}
++
++	template<typename T>
++	bool AnyNext(const T* items, uint32_t count)
++	{
++		for (uint32_t i = 0; i < count; i++)
++			if (items[i].pNext)
++				return true;
++		return false;
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage, VkDependencyFlags flags,
++		uint32_t memoryCount, const VkMemoryBarrier* memory, uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, uint32_t imageCount, const VkImageMemoryBarrier* images)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdPipelineBarrier(cb, srcStage, dstStage, flags, memoryCount, memory, bufferCount, buffers, imageCount, images))
++		if (AnyNext(memory, memoryCount) || AnyNext(buffers, bufferCount) || AnyNext(images, imageCount))
++		{
++			DirectCall d;
++			s_real.vkCmdPipelineBarrier(cb, srcStage, dstStage, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
++			return;
++		}
++		struct A { VkCommandBuffer cb; VkPipelineStageFlags srcStage, dstStage; VkDependencyFlags flags; uint32_t memoryCount; const VkMemoryBarrier* memory;
++			uint32_t bufferCount; const VkBufferMemoryBarrier* buffers; uint32_t imageCount; const VkImageMemoryBarrier* images; };
++		Rec<A> r([](A* a) { s_real.vkCmdPipelineBarrier(a->cb, a->srcStage, a->dstStage, a->flags, a->memoryCount, a->memory, a->bufferCount, a->buffers, a->imageCount, a->images); },
++			ArraySize<VkMemoryBarrier>(memoryCount) + ArraySize<VkBufferMemoryBarrier>(bufferCount) + ArraySize<VkImageMemoryBarrier>(imageCount));
++		*r.args = {cb, srcStage, dstStage, flags, memoryCount, nullptr, bufferCount, nullptr, imageCount, nullptr};
++		r.args->memory = r.extra.Array(memory, memoryCount);
++		r.args->buffers = r.extra.Array(buffers, bufferCount);
++		r.args->images = r.extra.Array(images, imageCount);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfo* dep)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdPipelineBarrier2KHR(cb, dep))
++		if (dep->pNext || AnyNext(dep->pMemoryBarriers, dep->memoryBarrierCount) || AnyNext(dep->pBufferMemoryBarriers, dep->bufferMemoryBarrierCount) ||
++			AnyNext(dep->pImageMemoryBarriers, dep->imageMemoryBarrierCount))
++		{
++			DirectCall d;
++			s_real.vkCmdPipelineBarrier2KHR(cb, dep);
++			return;
++		}
++		struct A { VkCommandBuffer cb; VkDependencyInfo dep; };
++		Rec<A> r([](A* a) { s_real.vkCmdPipelineBarrier2KHR(a->cb, &a->dep); },
++			ArraySize<VkMemoryBarrier2>(dep->memoryBarrierCount) + ArraySize<VkBufferMemoryBarrier2>(dep->bufferMemoryBarrierCount) +
++			ArraySize<VkImageMemoryBarrier2>(dep->imageMemoryBarrierCount));
++		r.args->cb = cb;
++		r.args->dep = *dep;
++		r.args->dep.pMemoryBarriers = r.extra.Array(dep->pMemoryBarriers, dep->memoryBarrierCount);
++		r.args->dep.pBufferMemoryBarriers = r.extra.Array(dep->pBufferMemoryBarriers, dep->bufferMemoryBarrierCount);
++		r.args->dep.pImageMemoryBarriers = r.extra.Array(dep->pImageMemoryBarriers, dep->imageMemoryBarrierCount);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy* regions)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdCopyBuffer(cb, src, dst, count, regions))
++		struct A { VkCommandBuffer cb; VkBuffer src, dst; uint32_t count; const VkBufferCopy* regions; };
++		Rec<A> r([](A* a) { s_real.vkCmdCopyBuffer(a->cb, a->src, a->dst, a->count, a->regions); }, ArraySize<VkBufferCopy>(count));
++		*r.args = {cb, src, dst, count, nullptr};
++		r.args->regions = r.extra.Array(regions, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout, VkImage dst, VkImageLayout dstLayout, uint32_t count, const VkImageCopy* regions)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdCopyImage(cb, src, srcLayout, dst, dstLayout, count, regions))
++		struct A { VkCommandBuffer cb; VkImage src; VkImageLayout srcLayout; VkImage dst; VkImageLayout dstLayout; uint32_t count; const VkImageCopy* regions; };
++		Rec<A> r([](A* a) { s_real.vkCmdCopyImage(a->cb, a->src, a->srcLayout, a->dst, a->dstLayout, a->count, a->regions); }, ArraySize<VkImageCopy>(count));
++		*r.args = {cb, src, srcLayout, dst, dstLayout, count, nullptr};
++		r.args->regions = r.extra.Array(regions, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout, VkImage dst, VkImageLayout dstLayout, uint32_t count, const VkImageBlit* regions, VkFilter filter)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBlitImage(cb, src, srcLayout, dst, dstLayout, count, regions, filter))
++		struct A { VkCommandBuffer cb; VkImage src; VkImageLayout srcLayout; VkImage dst; VkImageLayout dstLayout; uint32_t count; const VkImageBlit* regions; VkFilter filter; };
++		Rec<A> r([](A* a) { s_real.vkCmdBlitImage(a->cb, a->src, a->srcLayout, a->dst, a->dstLayout, a->count, a->regions, a->filter); }, ArraySize<VkImageBlit>(count));
++		*r.args = {cb, src, srcLayout, dst, dstLayout, count, nullptr, filter};
++		r.args->regions = r.extra.Array(regions, count);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* values)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdPushConstants(cb, layout, stages, offset, size, values))
++		struct A { VkCommandBuffer cb; VkPipelineLayout layout; VkShaderStageFlags stages; uint32_t offset, size; const void* values; };
++		Rec<A> r([](A* a) { s_real.vkCmdPushConstants(a->cb, a->layout, a->stages, a->offset, a->size, a->values); }, ArraySize<uint8>(size));
++		*r.args = {cb, layout, stages, offset, size, nullptr};
++		r.args->values = r.extra.Array((const uint8*)values, size);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdSetBlendConstants(VkCommandBuffer cb, const float constants[4])
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdSetBlendConstants(cb, constants))
++		struct A { VkCommandBuffer cb; float constants[4]; };
++		Rec<A> r([](A* a) { s_real.vkCmdSetBlendConstants(a->cb, a->constants); }, 0);
++		r.args->cb = cb;
++		memcpy(r.args->constants, constants, sizeof(float) * 4);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdSetDepthBias(VkCommandBuffer cb, float constantFactor, float clamp, float slopeFactor)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdSetDepthBias(cb, constantFactor, clamp, slopeFactor))
++		struct A { VkCommandBuffer cb; float constantFactor, clamp, slopeFactor; };
++		Rec<A> r([](A* a) { s_real.vkCmdSetDepthBias(a->cb, a->constantFactor, a->clamp, a->slopeFactor); }, 0);
++		*r.args = {cb, constantFactor, clamp, slopeFactor};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBeginRenderingKHR(VkCommandBuffer cb, const VkRenderingInfo* info)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBeginRenderingKHR(cb, info))
++		bool chained = info->pNext || AnyNext(info->pColorAttachments, info->colorAttachmentCount) ||
++			(info->pDepthAttachment && info->pDepthAttachment->pNext) || (info->pStencilAttachment && info->pStencilAttachment->pNext);
++		if (chained)
++		{
++			DirectCall d;
++			s_real.vkCmdBeginRenderingKHR(cb, info);
++			return;
++		}
++		struct A { VkCommandBuffer cb; VkRenderingInfo info; };
++		Rec<A> r([](A* a) { s_real.vkCmdBeginRenderingKHR(a->cb, &a->info); },
++			ArraySize<VkRenderingAttachmentInfo>(info->colorAttachmentCount) + ArraySize<VkRenderingAttachmentInfo>(info->pDepthAttachment ? 1 : 0) +
++			ArraySize<VkRenderingAttachmentInfo>(info->pStencilAttachment ? 1 : 0));
++		r.args->cb = cb;
++		r.args->info = *info;
++		r.args->info.pColorAttachments = r.extra.Array(info->pColorAttachments, info->colorAttachmentCount);
++		r.args->info.pDepthAttachment = r.extra.Array(info->pDepthAttachment, info->pDepthAttachment ? 1 : 0);
++		r.args->info.pStencilAttachment = r.extra.Array(info->pStencilAttachment, info->pStencilAttachment ? 1 : 0);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdEndRenderingKHR(VkCommandBuffer cb)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdEndRenderingKHR(cb))
++		struct A { VkCommandBuffer cb; };
++		Rec<A> r([](A* a) { s_real.vkCmdEndRenderingKHR(a->cb); }, 0);
++		r.args->cb = cb;
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdSetAttachmentFeedbackLoopEnableEXT(VkCommandBuffer cb, VkImageAspectFlags aspects)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdSetAttachmentFeedbackLoopEnableEXT(cb, aspects))
++		struct A { VkCommandBuffer cb; VkImageAspectFlags aspects; };
++		Rec<A> r([](A* a) { s_real.vkCmdSetAttachmentFeedbackLoopEnableEXT(a->cb, a->aspects); }, 0);
++		*r.args = {cb, aspects};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t count)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdResetQueryPool(cb, pool, first, count))
++		struct A { VkCommandBuffer cb; VkQueryPool pool; uint32_t first, count; };
++		Rec<A> r([](A* a) { s_real.vkCmdResetQueryPool(a->cb, a->pool, a->first, a->count); }, 0);
++		*r.args = {cb, pool, first, count};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdBeginQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query, VkQueryControlFlags flags)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdBeginQuery(cb, pool, query, flags))
++		struct A { VkCommandBuffer cb; VkQueryPool pool; uint32_t query; VkQueryControlFlags flags; };
++		Rec<A> r([](A* a) { s_real.vkCmdBeginQuery(a->cb, a->pool, a->query, a->flags); }, 0);
++		*r.args = {cb, pool, query, flags};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdEndQuery(cb, pool, query))
++		struct A { VkCommandBuffer cb; VkQueryPool pool; uint32_t query; };
++		Rec<A> r([](A* a) { s_real.vkCmdEndQuery(a->cb, a->pool, a->query); }, 0);
++		*r.args = {cb, pool, query};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdCopyQueryPoolResults(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t count, VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdCopyQueryPoolResults(cb, pool, first, count, dst, offset, stride, flags))
++		struct A { VkCommandBuffer cb; VkQueryPool pool; uint32_t first, count; VkBuffer dst; VkDeviceSize offset, stride; VkQueryResultFlags flags; };
++		Rec<A> r([](A* a) { s_real.vkCmdCopyQueryPoolResults(a->cb, a->pool, a->first, a->count, a->dst, a->offset, a->stride, a->flags); }, 0);
++		*r.args = {cb, pool, first, count, dst, offset, stride, flags};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdSetEvent(VkCommandBuffer cb, VkEvent event, VkPipelineStageFlags stage)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdSetEvent(cb, event, stage))
++		struct A { VkCommandBuffer cb; VkEvent event; VkPipelineStageFlags stage; };
++		Rec<A> r([](A* a) { s_real.vkCmdSetEvent(a->cb, a->event, a->stage); }, 0);
++		*r.args = {cb, event, stage};
++	}
++
++	VKAPI_ATTR void VKAPI_CALL CmdWaitEvents(VkCommandBuffer cb, uint32_t eventCount, const VkEvent* events, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
++		uint32_t memoryCount, const VkMemoryBarrier* memory, uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, uint32_t imageCount, const VkImageMemoryBarrier* images)
++	{
++		CREMA_VK_DIRECT(s_real.vkCmdWaitEvents(cb, eventCount, events, srcStage, dstStage, memoryCount, memory, bufferCount, buffers, imageCount, images))
++		if (AnyNext(memory, memoryCount) || AnyNext(buffers, bufferCount) || AnyNext(images, imageCount))
++		{
++			DirectCall d;
++			s_real.vkCmdWaitEvents(cb, eventCount, events, srcStage, dstStage, memoryCount, memory, bufferCount, buffers, imageCount, images);
++			return;
++		}
++		struct A { VkCommandBuffer cb; uint32_t eventCount; const VkEvent* events; VkPipelineStageFlags srcStage, dstStage; uint32_t memoryCount; const VkMemoryBarrier* memory;
++			uint32_t bufferCount; const VkBufferMemoryBarrier* buffers; uint32_t imageCount; const VkImageMemoryBarrier* images; };
++		Rec<A> r([](A* a) { s_real.vkCmdWaitEvents(a->cb, a->eventCount, a->events, a->srcStage, a->dstStage, a->memoryCount, a->memory, a->bufferCount, a->buffers, a->imageCount, a->images); },
++			ArraySize<VkEvent>(eventCount) + ArraySize<VkMemoryBarrier>(memoryCount) + ArraySize<VkBufferMemoryBarrier>(bufferCount) + ArraySize<VkImageMemoryBarrier>(imageCount));
++		*r.args = {cb, eventCount, nullptr, srcStage, dstStage, memoryCount, nullptr, bufferCount, nullptr, imageCount, nullptr};
++		r.args->events = r.extra.Array(events, eventCount);
++		r.args->memory = r.extra.Array(memory, memoryCount);
++		r.args->buffers = r.extra.Array(buffers, bufferCount);
++		r.args->images = r.extra.Array(images, imageCount);
++	}
++
++	// command buffers and the queue
++	VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* info)
++	{
++		CREMA_VK_DIRECT(s_real.vkBeginCommandBuffer(cb, info))
++		if (info->pNext || info->pInheritanceInfo)
++		{
++			DirectCall d;
++			return s_real.vkBeginCommandBuffer(cb, info);
++		}
++		struct A { VkCommandBuffer cb; VkCommandBufferBeginInfo info; };
++		Rec<A> r([](A* a) {
++			const VkResult result = s_real.vkBeginCommandBuffer(a->cb, &a->info);
++			if (result != VK_SUCCESS)
++				cemuLog_log(LogType::Force, "VkRecorder: vkBeginCommandBuffer failed: {}", (sint32)result);
++		}, 0);
++		*r.args = {cb, *info};
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer cb)
++	{
++		CREMA_VK_DIRECT(s_real.vkEndCommandBuffer(cb))
++		struct A { VkCommandBuffer cb; };
++		Rec<A> r([](A* a) {
++			const VkResult result = s_real.vkEndCommandBuffer(a->cb);
++			if (result != VK_SUCCESS)
++				cemuLog_log(LogType::Force, "VkRecorder: vkEndCommandBuffer failed: {}", (sint32)result);
++		}, 0);
++		r.args->cb = cb;
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer cb, VkCommandBufferResetFlags flags)
++	{
++		CREMA_VK_DIRECT(s_real.vkResetCommandBuffer(cb, flags))
++		struct A { VkCommandBuffer cb; VkCommandBufferResetFlags flags; };
++		Rec<A> r([](A* a) { s_real.vkResetCommandBuffer(a->cb, a->flags); }, 0);
++		*r.args = {cb, flags};
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* submits, VkFence fence)
++	{
++		CREMA_VK_DIRECT(s_real.vkQueueSubmit(queue, submitCount, submits, fence))
++		bool chained = false;
++		size_t extra = ArraySize<VkSubmitInfo>(submitCount);
++		for (uint32_t i = 0; i < submitCount; i++)
++		{
++			chained |= submits[i].pNext != nullptr;
++			extra += ArraySize<VkSemaphore>(submits[i].waitSemaphoreCount) + ArraySize<VkPipelineStageFlags>(submits[i].waitSemaphoreCount) +
++				ArraySize<VkCommandBuffer>(submits[i].commandBufferCount) + ArraySize<VkSemaphore>(submits[i].signalSemaphoreCount);
++		}
++		if (chained)
++		{
++			DirectCall d;
++			return s_real.vkQueueSubmit(queue, submitCount, submits, fence);
++		}
++		struct A { VkQueue queue; uint32_t submitCount; const VkSubmitInfo* submits; VkFence fence; };
++		Rec<A> r([](A* a) {
++			const VkResult result = s_real.vkQueueSubmit(a->queue, a->submitCount, a->submits, a->fence);
++			if (result != VK_SUCCESS)
++				cemuLog_log(LogType::Force, "VkRecorder: vkQueueSubmit failed: {}", (sint32)result);
++		}, extra);
++		*r.args = {queue, submitCount, nullptr, fence};
++		VkSubmitInfo* copies = (VkSubmitInfo*)r.extra.Array(submits, submitCount);
++		for (uint32_t i = 0; i < submitCount; i++)
++		{
++			copies[i].pWaitSemaphores = r.extra.Array(submits[i].pWaitSemaphores, submits[i].waitSemaphoreCount);
++			copies[i].pWaitDstStageMask = r.extra.Array(submits[i].pWaitDstStageMask, submits[i].waitSemaphoreCount);
++			copies[i].pCommandBuffers = r.extra.Array(submits[i].pCommandBuffers, submits[i].commandBufferCount);
++			copies[i].pSignalSemaphores = r.extra.Array(submits[i].pSignalSemaphores, submits[i].signalSemaphoreCount);
++		}
++		r.args->submits = copies;
++		return VK_SUCCESS;
++	}
++
++	// queue access from the CPU side: everything recorded so far goes first
++	VKAPI_ATTR VkResult VKAPI_CALL QueueWaitIdle(VkQueue queue)
++	{
++		DirectCall d;
++		return s_real.vkQueueWaitIdle(queue);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL DeviceWaitIdle(VkDevice device)
++	{
++		DirectCall d;
++		return s_real.vkDeviceWaitIdle(device);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		DirectCall d;
++		return s_real.vkQueuePresentKHR(queue, info);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* index)
++	{
++		DirectCall d; // PS4WSI submits to the queue here
++		return s_real.vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
++	}
++
++	bool s_enabled = false;
++}
++
++// After InitializeDeviceVulkan (VulkanRenderer.cpp): with /data/Crema/vkthread.txt holding "1",
++// the recording functions go through the recording thread from now on.
++void CremaVkRecorder_Install()
++{
++	bool on = false;
++#ifndef CREMA_VKTHREAD_SWITCH
++#define CREMA_VKTHREAD_SWITCH "/data/Crema/vkthread.txt"
++#endif
++	if (FILE* f = fopen(CREMA_VKTHREAD_SWITCH, "rb"))
++	{
++		on = fgetc(f) == '1';
++		fclose(f);
++	}
++	if (!on)
++		return;
++	s_ring = (uint8*)malloc(kRingSize);
++	if (!s_ring)
++	{
++		cemuLog_log(LogType::Force, "VkRecorder: no memory for the ring buffer");
++		return;
++	}
++#define CREMA_VK_HOOK(fn, wrapper) s_real.fn = fn; fn = wrapper;
++	CREMA_VK_HOOK(vkCmdBeginRenderPass, CmdBeginRenderPass)
++	CREMA_VK_HOOK(vkCmdEndRenderPass, CmdEndRenderPass)
++	CREMA_VK_HOOK(vkCmdBindPipeline, CmdBindPipeline)
++	CREMA_VK_HOOK(vkCmdDraw, CmdDraw)
++	CREMA_VK_HOOK(vkCmdCopyBufferToImage, CmdCopyBufferToImage)
++	CREMA_VK_HOOK(vkCmdCopyImageToBuffer, CmdCopyImageToBuffer)
++	CREMA_VK_HOOK(vkCmdClearColorImage, CmdClearColorImage)
++	CREMA_VK_HOOK(vkCmdClearAttachments, CmdClearAttachments)
++	CREMA_VK_HOOK(vkCmdBindIndexBuffer, CmdBindIndexBuffer)
++	CREMA_VK_HOOK(vkCmdBindVertexBuffers, CmdBindVertexBuffers)
++	CREMA_VK_HOOK(vkCmdDrawIndexed, CmdDrawIndexed)
++	CREMA_VK_HOOK(vkCmdSetViewport, CmdSetViewport)
++	CREMA_VK_HOOK(vkCmdSetScissor, CmdSetScissor)
++	CREMA_VK_HOOK(vkCmdBindDescriptorSets, CmdBindDescriptorSets)
++	CREMA_VK_HOOK(vkCmdPipelineBarrier, CmdPipelineBarrier)
++	CREMA_VK_HOOK(vkCmdClearDepthStencilImage, CmdClearDepthStencilImage)
++	CREMA_VK_HOOK(vkCmdCopyBuffer, CmdCopyBuffer)
++	CREMA_VK_HOOK(vkCmdCopyImage, CmdCopyImage)
++	CREMA_VK_HOOK(vkCmdBlitImage, CmdBlitImage)
++	CREMA_VK_HOOK(vkCmdPushConstants, CmdPushConstants)
++	CREMA_VK_HOOK(vkCmdSetBlendConstants, CmdSetBlendConstants)
++	CREMA_VK_HOOK(vkCmdSetDepthBias, CmdSetDepthBias)
++	CREMA_VK_HOOK(vkCmdSetAttachmentFeedbackLoopEnableEXT, CmdSetAttachmentFeedbackLoopEnableEXT)
++	CREMA_VK_HOOK(vkCmdResetQueryPool, CmdResetQueryPool)
++	CREMA_VK_HOOK(vkCmdBeginQuery, CmdBeginQuery)
++	CREMA_VK_HOOK(vkCmdEndQuery, CmdEndQuery)
++	CREMA_VK_HOOK(vkCmdCopyQueryPoolResults, CmdCopyQueryPoolResults)
++	CREMA_VK_HOOK(vkCmdSetEvent, CmdSetEvent)
++	CREMA_VK_HOOK(vkCmdWaitEvents, CmdWaitEvents)
++	CREMA_VK_HOOK(vkBeginCommandBuffer, BeginCommandBuffer)
++	CREMA_VK_HOOK(vkEndCommandBuffer, EndCommandBuffer)
++	CREMA_VK_HOOK(vkResetCommandBuffer, ResetCommandBuffer)
++	CREMA_VK_HOOK(vkQueueSubmit, QueueSubmit)
++	CREMA_VK_HOOK(vkQueueWaitIdle, QueueWaitIdle)
++	CREMA_VK_HOOK(vkDeviceWaitIdle, DeviceWaitIdle)
++	CREMA_VK_HOOK(vkQueuePresentKHR, QueuePresentKHR)
++	CREMA_VK_HOOK(vkAcquireNextImageKHR, AcquireNextImageKHR)
++#undef CREMA_VK_HOOK
++	// the dynamic rendering and synchronization2 entry points exist only with their extensions
++	if (vkCmdPipelineBarrier2KHR)
++	{
++		s_real.vkCmdPipelineBarrier2KHR = vkCmdPipelineBarrier2KHR;
++		vkCmdPipelineBarrier2KHR = CmdPipelineBarrier2KHR;
++	}
++	if (vkCmdBeginRenderingKHR && vkCmdEndRenderingKHR)
++	{
++		s_real.vkCmdBeginRenderingKHR = vkCmdBeginRenderingKHR;
++		vkCmdBeginRenderingKHR = CmdBeginRenderingKHR;
++		s_real.vkCmdEndRenderingKHR = vkCmdEndRenderingKHR;
++		vkCmdEndRenderingKHR = CmdEndRenderingKHR;
++	}
++	std::thread(RecordingThread).detach();
++	s_enabled = true;
++	cemuLog_log(LogType::Force, "VkRecorder: Vulkan commands are recorded on their own thread (/data/Crema/vkthread.txt)");
++}
++
++// Crema Live ("vk"): records and drains so far
++void CremaVkRecorder_Stats(bool& enabled, uint64& records, uint64& drains)
++{
++	enabled = s_enabled;
++	records = s_records.load(std::memory_order_relaxed);
++	drains = s_drains.load(std::memory_order_relaxed);
++}
++
++void CremaVkRecorder_SetDeferred(bool deferred)
++{
++	s_deferred.store(deferred, std::memory_order_relaxed);
++}
++
++bool CremaVkRecorder_Deferred()
++{
++	return s_enabled && s_deferred.load(std::memory_order_relaxed);
++}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..fd9df44 100644
+index 599190a..a7c90eb 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-@@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
+@@ -1,3 +1,6 @@
++#if defined(__ORBIS__)
++void CremaVkRecorder_Install(); // VulkanRecorderPS4.cpp
++#endif
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.h"
+@@ -113,6 +116,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
  	requiredExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -3264,7 +4044,17 @@ index 599190a..fd9df44 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -876,6 +878,9 @@ VulkanRenderer::~VulkanRenderer()
+@@ -757,6 +762,9 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+ 	}
+ 
+ 	InitializeDeviceVulkan(m_logicalDevice);
++#if defined(__ORBIS__)
++	CremaVkRecorder_Install(); // VulkanRecorderPS4.cpp: commands recorded on their own thread (vkthread.txt)
++#endif
+ 
+ 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_graphicsQueue);
+ 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_presentQueue);
+@@ -876,6 +884,9 @@ VulkanRenderer::~VulkanRenderer()
  	}
  
  	vkDestroyDescriptorPool(m_logicalDevice, m_descriptorPool, nullptr);
@@ -3274,7 +4064,7 @@ index 599190a..fd9df44 100644
  
  	for(auto& i : m_backbufferBlitPipelineCache)
  	{
-@@ -1491,6 +1496,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+@@ -1491,6 +1502,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
  	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -3283,7 +4073,7 @@ index 599190a..fd9df44 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1578,7 +1585,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+@@ -1578,7 +1591,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
  }
  #endif
  
@@ -3292,7 +4082,7 @@ index 599190a..fd9df44 100644
  VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
  {
      VkXlibSurfaceCreateInfoKHR sci{};
-@@ -1642,6 +1649,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+@@ -1642,6 +1655,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
  {
  #if BOOST_OS_WINDOWS
  	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
@@ -3301,7 +4091,7 @@ index 599190a..fd9df44 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -2280,7 +2289,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+@@ -2280,7 +2295,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
  	occlusionQuery_notifyBeginCommandBuffer();
  
  	m_recordedDrawcalls = 0;
@@ -3315,7 +4105,7 @@ index 599190a..fd9df44 100644
  	m_submitOnIdle = false;
  }
  
-@@ -3038,7 +3053,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3038,7 +3059,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -3328,7 +4118,7 @@ index 599190a..fd9df44 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3077,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3083,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -3337,7 +4127,7 @@ index 599190a..fd9df44 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3282,6 +3302,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3282,6 +3308,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -3387,7 +4177,7 @@ index 599190a..fd9df44 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3363,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3369,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -3400,7 +4190,7 @@ index 599190a..fd9df44 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -4379,6 +4444,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4450,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -5239,10 +6029,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..2650972
+index 0000000..e6ac088
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,491 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -5254,6 +6044,7 @@ index 0000000..2650972
 +//   branches                calls and returns per second since the last "branches"
 +//   cores [ms]              spare time of each app core (0-6): a lowest-priority probe per core
 +//   set latte_slow <pct>    the GPU command thread waits that share of its work on top of it
++//   set vk_thread 0|1       Vulkan commands recorded on their own thread (needs vkthread.txt at start)
 +//   threads                 the game's threads: name, cores allowed (1 core0, 2 core1, 4 core2), priority, state
 +//   affinity <name> <mask>  the cores the threads whose name contains <name> may run on
 +//   fps <seconds>           frame rate over that time (waits) and the CPU use of the busy threads:
@@ -5313,6 +6104,9 @@ index 0000000..2650972
 +extern "C" int ps4_thread_cpu_snapshot(const char** names, uint64_t* ns, int max);
 +extern "C" int ps4_core_probe(int ms, uint64_t* counts, int maxCores); // port/ps4_runtime.cpp
 +extern std::atomic<uint32> g_crema_latte_slow; // HW/Latte/Core/LatteCommandProcessor.cpp
++void CremaVkRecorder_SetDeferred(bool deferred); // HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp
++bool CremaVkRecorder_Deferred();
++void CremaVkRecorder_Stats(bool& enabled, uint64& records, uint64& drains);
 +extern "C" void ps4_heap_usage(uint64_t* main_size, uint64_t* main_grown, uint64_t* overflow_size, uint64_t* overflow_grown);
 +
 +namespace
@@ -5335,10 +6129,10 @@ index 0000000..2650972
 +	std::string Values()
 +	{
 +		char line[256];
-+		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d latte_slow=%u prof=%d",
++		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d latte_slow=%u vk_thread=%d prof=%d",
 +			g_crema_fast_cycles ? 1 : 0, g_crema_cl_shifts ? 1 : 0, g_crema_fast_compares ? 1 : 0,
 +			(unsigned long long)g_crema_ra_budget.load(), (int)g_crema_ra_scan.load(), ppcThreadQuantum,
-+			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, g_crema_latte_slow.load(), s_profilerOn.load() ? 1 : 0);
++			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, g_crema_latte_slow.load(), CremaVkRecorder_Deferred() ? 1 : 0, s_profilerOn.load() ? 1 : 0);
 +		return line;
 +	}
 +
@@ -5363,6 +6157,15 @@ index 0000000..2650972
 +			g_crema_count_branches = number != 0;
 +		else if (name == "latte_slow" && number <= 200)
 +			g_crema_latte_slow = (uint32)number;
++		else if (name == "vk_thread")
++		{
++			bool enabled;
++			uint64 records, drains;
++			CremaVkRecorder_Stats(enabled, records, drains);
++			if (!enabled)
++				return "error: the recording thread isn't installed (/data/Crema/vkthread.txt = 1, then start the game)";
++			CremaVkRecorder_SetDeferred(number != 0);
++		}
 +		else
 +			return "error: unknown setting or value: " + name + " " + value;
 +		cemuLog_log(LogType::Force, "Crema Live: {} = {}", name, value);
