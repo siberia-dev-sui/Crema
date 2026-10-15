@@ -675,8 +675,8 @@ void execProbeHandler(int, siginfo_t*, void* context) {
 }
 
 // Whether code placed at `code` (mapped RWX) runs.
-bool runsCode(void* code) {
-    static_cast<volatile uint8_t*>(code)[0] = 0xC3;  // ret
+bool runsCode(void* code, void* writeAt = nullptr) {
+    static_cast<volatile uint8_t*>(writeAt ? writeAt : code)[0] = 0xC3;  // ret (through another view of it, if given)
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     void (*handler)(int, siginfo_t*, void*) = execProbeHandler;
@@ -851,6 +851,65 @@ ExecSource chooseExecSource() {
 }
 
 }  // namespace
+
+// Crema experiment (/data/Crema/largecode.txt = 1), second way: the PS4 refuses mapping direct memory
+// writable and executable at once (0x80020016), so each recompiler code block gets two views of the
+// same 2 MiB-aligned direct memory: read+execute where the code runs (fetched through 2 MiB pages:
+// the generated code spreads over ~100 MB) and read+write where the recompiler copies it in
+// (BackendX64.cpp). Null when off or not possible; the first block is checked to run code.
+extern "C" void* ps4_map_code_dual(size_t len, void** writable) {
+    static int s_state = -1;  // -1: not tried yet, 0: off, 1: works
+    if (s_state == 0)
+        return nullptr;
+    if (s_state < 0 && !switchOn("/data/Crema/largecode.txt")) {
+        s_state = 0;
+        return nullptr;
+    }
+    const int32_t kProtReadExec = 0x5;
+    const size_t size = (len + 2 * MB - 1) & ~(2 * MB - 1);
+    off_t phys = 0;
+    int32_t r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys);
+    if (r != 0) {
+        heapLog("[cemu] code (two views): no 2 MiB-aligned direct memory for %zu KiB (0x%x)\n", size / 1024, r);
+        s_state = 0;
+        return nullptr;
+    }
+    void* rx = reinterpret_cast<void*>(0x1400000000ull);
+    r = sceKernelMapDirectMemory(&rx, size, kProtReadExec, 0, phys, 2 * MB);
+    if (r != 0 || reinterpret_cast<uintptr_t>(rx) < 0x400000000ull) {
+        heapLog("[cemu] code (two views): not mapped read+execute (0x%x, %p), off\n", r, rx);
+        if (r == 0)
+            sceKernelMunmap(rx, size);
+        sceKernelReleaseDirectMemory(phys, size);
+        s_state = 0;
+        return nullptr;
+    }
+    void* rw = reinterpret_cast<void*>(0x1500000000ull);
+    r = sceKernelMapDirectMemory(&rw, size, PROT_CPU_RW, 0, phys, 2 * MB);
+    if (r != 0 || reinterpret_cast<uintptr_t>(rw) < 0x400000000ull) {
+        heapLog("[cemu] code (two views): not mapped read+write (0x%x, %p), off\n", r, rw);
+        if (r == 0)
+            sceKernelMunmap(rw, size);
+        sceKernelMunmap(rx, size);
+        sceKernelReleaseDirectMemory(phys, size);
+        s_state = 0;
+        return nullptr;
+    }
+    if (s_state < 0) {
+        if (!runsCode(rx, rw)) {
+            heapLog("[cemu] code (two views): the read+execute view does not run code, off\n");
+            sceKernelMunmap(rw, size);
+            sceKernelMunmap(rx, size);
+            sceKernelReleaseDirectMemory(phys, size);
+            s_state = 0;
+            return nullptr;
+        }
+        heapLog("[cemu] code (two views): recompiler code through 2 MiB pages, runs at %p, written at %p (largecode.txt)\n", rx, rw);
+        s_state = 1;
+    }
+    *writable = rw;
+    return rx;
+}
 
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     const bool anonymous = fd == -1 && (flags & MAP_ANON) && !(flags & MAP_FIXED);
