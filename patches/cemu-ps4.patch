@@ -2519,10 +2519,10 @@ index 743ab67..bc6b5cd 100644
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..3828c62
+index 0000000..5a9ef72
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,535 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -2545,6 +2545,14 @@ index 0000000..3828c62
 +
 +// Frames presented since start; Crema Live (gui/ps4/CremaLive.cpp) measures the frame rate with it.
 +std::atomic<uint64_t> g_crema_presents{0};
++
++// Presents asked for by the renderer, counted when it asks: with Vulkan commands recorded on their
++// own thread (VulkanRecorderPS4.cpp) the present runs there later, and an acquire must still wait
++// for the image the renderer's previous presents put on screen.
++std::atomic<uint64_t> g_crema_presents_issued{0};
++thread_local bool t_crema_present_counted = false; // set by the recording thread around a present it replays
++void PS4WSI_CountIssuedPresents(uint32 count) { g_crema_presents_issued.fetch_add(count, std::memory_order_relaxed); }
++void PS4WSI_SetPresentCounted(bool counted) { t_crema_present_counted = counted; }
 +
 +namespace
 +{
@@ -2880,9 +2888,10 @@ index 0000000..3828c62
 +
 +	void WaitImageOffScreen(uint32 imageCount)
 +	{
-+		if (sFlipsSubmitted < imageCount - 1)
++		const uint64 issued = g_crema_presents_issued.load(std::memory_order_relaxed);
++		if (issued < imageCount - 1)
 +			return;
-+		const sint64 needed = (sint64)(sFlipsSubmitted - (imageCount - 2));
++		const sint64 needed = (sint64)(issued - (imageCount - 2));
 +		const auto t0 = std::chrono::steady_clock::now();
 +		bool done = false;
 +		for (int tries = 0; tries < 40 && !done; tries++)
@@ -2951,6 +2960,8 @@ index 0000000..3828c62
 +
 +	VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info)
 +	{
++		if (!t_crema_present_counted)
++			PS4WSI_CountIssuedPresents(info->swapchainCount);
 +		VkResult result = VK_SUCCESS;
 +		for (uint32 i = 0; i < info->swapchainCount; i++)
 +		{
@@ -3253,10 +3264,10 @@ index 7179087..af4a1d9 100644
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp
 new file mode 100644
-index 0000000..eb02fa7
+index 0000000..4a49a18
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,817 @@
 +// Crema (PS4): Vulkan command recording on its own thread.
 +//
 +// The GPU command thread (LatteThread) spends ~40% of its time inside the driver recording
@@ -3286,6 +3297,8 @@ index 0000000..eb02fa7
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp
 +extern "C" void ps4_thread_cpu_tick(); // port/ps4_sampler.cpp
 +void SetThreadName(const char* name);
++void PS4WSI_CountIssuedPresents(uint32 count); // PS4WSI.cpp
++void PS4WSI_SetPresentCounted(bool counted);
 +
 +namespace
 +{
@@ -3327,6 +3340,7 @@ index 0000000..eb02fa7
 +	std::mutex s_wakeLock;
 +	std::condition_variable s_wake;
 +	std::atomic<uint64> s_records{0}, s_drains{0};
++	std::atomic<uint64> s_drainTicks{0}, s_fullTicks{0}; // TSC ticks the producer waited: drains, ring full
 +
 +	inline size_t Align16(size_t n) { return (n + 15) & ~(size_t)15; }
 +
@@ -3335,6 +3349,7 @@ index 0000000..eb02fa7
 +	{
 +		size = Align16(size);
 +		size_t write = s_writePos.load(std::memory_order_relaxed);
++		uint64 waitStart = 0;
 +		for (uint32 spins = 0;; spins++)
 +		{
 +			const size_t read = s_readPos.load(std::memory_order_acquire);
@@ -3342,7 +3357,13 @@ index 0000000..eb02fa7
 +			const size_t tailRoom = kRingSize - write;
 +			const size_t need = size + (tailRoom < size ? tailRoom : 0) + 16; // keep a gap: write == read means empty
 +			if (kRingSize - used >= need)
++			{
++				if (waitStart)
++					s_fullTicks.fetch_add(__rdtsc() - waitStart, std::memory_order_relaxed);
 +				break;
++			}
++			if (!waitStart)
++				waitStart = __rdtsc();
 +			if (spins < 1000)
 +				_mm_pause();
 +			else
@@ -3376,7 +3397,10 @@ index 0000000..eb02fa7
 +	void Drain()
 +	{
 +		const size_t target = s_writePos.load(std::memory_order_acquire);
++		if (s_readPos.load(std::memory_order_acquire) == target)
++			return;
 +		s_drains.fetch_add(1, std::memory_order_relaxed);
++		const uint64 start = __rdtsc();
 +		for (uint32 spins = 0; s_readPos.load(std::memory_order_acquire) != target; spins++)
 +		{
 +			if (spins < 4000)
@@ -3384,6 +3408,7 @@ index 0000000..eb02fa7
 +			else
 +				std::this_thread::yield();
 +		}
++		s_drainTicks.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
 +	}
 +
 +	void RecordingThread()
@@ -3914,15 +3939,44 @@ index 0000000..eb02fa7
 +		return s_real.vkDeviceWaitIdle(device);
 +	}
 +
++	// The present is recorded like the commands before it: the GPU-side flip goes behind them on
++	// the queue, and the renderer goes on with the next frame. PS4WSI counts it as issued now, so
++	// the next acquire waits for the right image (PS4WSI.cpp: WaitImageOffScreen).
 +	VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info)
 +	{
-+		DirectCall d;
-+		return s_real.vkQueuePresentKHR(queue, info);
++		if (!s_deferred.load(std::memory_order_relaxed) || info->pNext)
++		{
++			DirectCall d;
++			return s_real.vkQueuePresentKHR(queue, info);
++		}
++		PS4WSI_CountIssuedPresents(info->swapchainCount);
++		struct A { VkQueue queue; VkPresentInfoKHR info; };
++		Rec<A> r([](A* a) {
++			PS4WSI_SetPresentCounted(true);
++			const VkResult result = s_real.vkQueuePresentKHR(a->queue, &a->info);
++			PS4WSI_SetPresentCounted(false);
++			if (result != VK_SUCCESS)
++				cemuLog_log(LogType::Force, "VkRecorder: vkQueuePresentKHR failed: {}", (sint32)result);
++		}, ArraySize<VkSemaphore>(info->waitSemaphoreCount) + ArraySize<VkSwapchainKHR>(info->swapchainCount) + ArraySize<uint32_t>(info->swapchainCount));
++		r.args->queue = queue;
++		r.args->info = *info;
++		r.args->info.pWaitSemaphores = r.extra.Array(info->pWaitSemaphores, info->waitSemaphoreCount);
++		r.args->info.pSwapchains = r.extra.Array(info->pSwapchains, info->swapchainCount);
++		r.args->info.pImageIndices = r.extra.Array(info->pImageIndices, info->swapchainCount);
++		r.args->info.pResults = nullptr;
++		if (info->pResults)
++			for (uint32_t i = 0; i < info->swapchainCount; i++)
++				info->pResults[i] = VK_SUCCESS;
++		return VK_SUCCESS;
 +	}
 +
++	// Without a semaphore or fence (the PS4 renderer, SwapchainInfoVk.cpp) PS4WSI's acquire only
++	// waits on the CPU for the image to leave the screen: no queue access, nothing to wait for here.
 +	VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* index)
 +	{
-+		DirectCall d; // PS4WSI submits to the queue here
++		if (semaphore == VK_NULL_HANDLE && fence == VK_NULL_HANDLE)
++			return s_real.vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
++		DirectCall d; // PS4WSI submits to the queue to signal them
 +		return s_real.vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
 +	}
 +
@@ -4013,6 +4067,13 @@ index 0000000..eb02fa7
 +	enabled = s_enabled;
 +	records = s_records.load(std::memory_order_relaxed);
 +	drains = s_drains.load(std::memory_order_relaxed);
++}
++
++// TSC ticks the renderer waited for the recording thread: drains, and a full ring
++void CremaVkRecorder_WaitTicks(uint64& drainTicks, uint64& fullTicks)
++{
++	drainTicks = s_drainTicks.load(std::memory_order_relaxed);
++	fullTicks = s_fullTicks.load(std::memory_order_relaxed);
 +}
 +
 +void CremaVkRecorder_SetDeferred(bool deferred)
@@ -6029,10 +6090,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..e6ac088
+index 0000000..070ad11
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,515 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -6045,6 +6106,7 @@ index 0000000..e6ac088
 +//   cores [ms]              spare time of each app core (0-6): a lowest-priority probe per core
 +//   set latte_slow <pct>    the GPU command thread waits that share of its work on top of it
 +//   set vk_thread 0|1       Vulkan commands recorded on their own thread (needs vkthread.txt at start)
++//   vk [seconds]            the recording thread: commands/s, drains/s and the renderer's time waiting for it
 +//   threads                 the game's threads: name, cores allowed (1 core0, 2 core1, 4 core2), priority, state
 +//   affinity <name> <mask>  the cores the threads whose name contains <name> may run on
 +//   fps <seconds>           frame rate over that time (waits) and the CPU use of the busy threads:
@@ -6068,6 +6130,7 @@ index 0000000..e6ac088
 +#include <netinet/in.h>
 +#include <sys/socket.h>
 +#include <unistd.h>
++#include <immintrin.h> // __rdtsc
 +
 +#include <algorithm>
 +#include <atomic>
@@ -6107,6 +6170,7 @@ index 0000000..e6ac088
 +void CremaVkRecorder_SetDeferred(bool deferred); // HW/Latte/Renderer/Vulkan/VulkanRecorderPS4.cpp
 +bool CremaVkRecorder_Deferred();
 +void CremaVkRecorder_Stats(bool& enabled, uint64& records, uint64& drains);
++void CremaVkRecorder_WaitTicks(uint64& drainTicks, uint64& fullTicks);
 +extern "C" void ps4_heap_usage(uint64_t* main_size, uint64_t* main_grown, uint64_t* overflow_size, uint64_t* overflow_grown);
 +
 +namespace
@@ -6370,6 +6434,27 @@ index 0000000..e6ac088
 +			return Memory();
 +		if (cmd == "membench")
 +			return MemBench();
++		if (cmd == "vk")
++		{
++			double seconds = 5.0;
++			in >> seconds;
++			seconds = std::clamp(seconds, 0.5, 60.0);
++			bool enabled;
++			uint64 r0, d0, r1, d1, dt0, ft0, dt1, ft1;
++			CremaVkRecorder_Stats(enabled, r0, d0);
++			if (!enabled)
++				return "vk: not installed (/data/Crema/vkthread.txt = 1, then start the game)";
++			CremaVkRecorder_WaitTicks(dt0, ft0);
++			const uint64 t0 = __rdtsc();
++			std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
++			CremaVkRecorder_Stats(enabled, r1, d1);
++			CremaVkRecorder_WaitTicks(dt1, ft1);
++			const double ticks = (double)(__rdtsc() - t0);
++			char line[200];
++			snprintf(line, sizeof(line), "vk %s: %.0f commands/s, %.0f drains/s, renderer waiting %.1f%% in drains, %.1f%% on a full ring",
++				CremaVkRecorder_Deferred() ? "on" : "off", (r1 - r0) / seconds, (d1 - d0) / seconds, 100.0 * (dt1 - dt0) / ticks, 100.0 * (ft1 - ft0) / ticks);
++			return line;
++		}
 +		if (cmd == "cores")
 +		{
 +			int ms = 1000;
@@ -6420,7 +6505,7 @@ index 0000000..e6ac088
 +			cemuLog_log(LogType::Force, "Crema Live mark:{}", rest);
 +			return "ok";
 +		}
-+		return "error: commands get, set, fps, prof, hot, inval, flush, mem, membench, branches, cores, threads, affinity, hud, mark";
++		return "error: commands get, set, fps, prof, hot, inval, flush, mem, membench, branches, vk, cores, threads, affinity, hud, mark";
 +	}
 +
 +	void Serve(int client)
