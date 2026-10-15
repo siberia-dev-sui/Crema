@@ -229,7 +229,7 @@ index 257973a..2d7d62b 100644
  	_rdtscAcc.low = remainder;
  	_rdtscAcc.high = 0;
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..a83e242 100644
+index e466deb..fabca63 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -8,6 +8,10 @@
@@ -273,7 +273,7 @@ index e466deb..a83e242 100644
  {
  	void* prevRSPTemp = hCPU->rspTemp;
  	if( hleFuncId == 0xFFD0 )
-@@ -165,8 +190,12 @@ void* ATTR_MS_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFun
+@@ -165,18 +190,41 @@ void* ATTR_MS_ABI PPCRecompiler_virtualHLE(PPCInterpreter_t* hCPU, uint32 hleFun
  	}
  	else
  	{
@@ -287,7 +287,44 @@ index e466deb..a83e242 100644
  		hleCall(hCPU);
  	}
  	hCPU->rspTemp = prevRSPTemp;
-@@ -276,9 +305,14 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction,
+ 	return PPCInterpreter_getCurrentInstance();
+ }
+ 
++// Crema Live: guest calls (bl, 0) and indirect branches (blr/bctr, 1) executed, in code generated
++// while g_crema_count_branches is on (gui/ps4/CremaLive.cpp turns it on and recompiles). Not
++// atomic: a statistic.
++std::atomic<bool> g_crema_count_branches{false};
++uint64 g_crema_branch_counts[2]{};
++
++static void CremaEmitBranchCount(x64GenContext_t* x64GenContext, int index)
++{
++	if (!g_crema_count_branches.load(std::memory_order_relaxed))
++		return;
++	// the segment ends here: nothing lives in the reserved temporary or the flags
++	x64Gen_mov_reg64_imm64(x64GenContext, REG_RESV_TEMP, (uint64)&g_crema_branch_counts[index]);
++	// INC QWORD [R14]
++	x64Gen_writeU8(x64GenContext, 0x49);
++	x64Gen_writeU8(x64GenContext, 0xFF);
++	x64Gen_writeU8(x64GenContext, 0x06);
++}
++
+ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction, ppcImlGenContext_t* ppcImlGenContext, x64GenContext_t* x64GenContext, IMLInstruction* imlInstruction)
+ {
+ 	if (imlInstruction->operation == PPCREC_IML_MACRO_B_TO_REG)
+ 	{
++		CremaEmitBranchCount(x64GenContext, 1);
+ 		//x64Gen_int3(x64GenContext);
+ 		uint32 branchDstReg = _reg32(imlInstruction->op_macro.paramReg);
+ 		if(X86_REG_RDX != branchDstReg)
+@@ -192,6 +240,7 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction,
+ 	}
+ 	else if( imlInstruction->operation == PPCREC_IML_MACRO_BL )
+ 	{
++		CremaEmitBranchCount(x64GenContext, 0);
+ 		// MOV DWORD [SPR_LinkRegister], newLR
+ 		uint32 newLR = imlInstruction->op_macro.param + 4;
+ 		x64Gen_mov_mem32Reg64_imm32(x64GenContext, REG_RESV_HCPU, offsetof(PPCInterpreter_t, spr.LR), newLR);
+@@ -276,9 +325,14 @@ bool PPCRecompilerX64Gen_imlInstruction_macro(PPCRecFunction_t* PPCRecFunction,
  		uint32 funcId = imlInstruction->op_macro.param2;
  		// update instruction pointer
  		x64Gen_mov_mem32Reg64_imm32(x64GenContext, REG_RESV_HCPU, offsetof(PPCInterpreter_t, instructionPointer), ppcAddress);
@@ -303,7 +340,7 @@ index e466deb..a83e242 100644
  		// restore stackpointer from hCPU->rspTemp
  		x64Emit_mov_reg64_mem64(x64GenContext, X86_REG_RSP, REG_RESV_HCPU, offsetof(PPCInterpreter_t, rspTemp));
  		// reserve space on stack for call parameters
-@@ -738,6 +772,23 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -738,6 +792,23 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  			x64Gen_shlx_reg64_reg64_reg64(x64GenContext, rRegResult, rRegOperand1, rRegOperand2);
  			x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
  		}
@@ -327,7 +364,7 @@ index e466deb..a83e242 100644
  		else
  		{
  			// lazy and slow way to do shift by register without relying on ECX/CL or BMI2
-@@ -766,8 +817,19 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -766,8 +837,19 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  	else if( imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE )
  	{
  		// todo: Use BMI2 rotate if available
@@ -348,7 +385,7 @@ index e466deb..a83e242 100644
  		{
  			// swap operand 2 with RCX
  			x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
-@@ -1342,8 +1404,12 @@ sint32 codeMemoryBlockSize = 0;
+@@ -1342,8 +1424,12 @@ sint32 codeMemoryBlockSize = 0;
  
  std::mutex mtx_allocExecutableMemory;
  
@@ -1831,7 +1868,7 @@ index de67772..24b109b 100644
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
 diff --git a/src/Cafe/HW/Latte/Core/LatteOverlay.cpp b/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
-index 8fdc8f3..019e203 100644
+index 8fdc8f3..45c6142 100644
 --- a/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteOverlay.cpp
 @@ -14,6 +14,10 @@
@@ -1845,7 +1882,7 @@ index 8fdc8f3..019e203 100644
  
  struct OverlayStats
  {
-@@ -68,6 +72,362 @@ struct OverlayList
+@@ -68,6 +72,408 @@ struct OverlayList
  const auto kPopupFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
  
  const float kBackgroundAlpha = 0.65f;
@@ -1867,6 +1904,7 @@ index 8fdc8f3..019e203 100644
 +extern uint32 ppcThreadQuantum;
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; }
 +void CremaLive_HudState(std::string& hudLine, std::string& lastResult, int& clients, bool& profilerOn); // gui/ps4/CremaLive.cpp
++bool CremaLive_BranchRates(double& callsPerSecond, double& returnsPerSecond); // gui/ps4/CremaLive.cpp: false while not counting
 +extern "C" int ps4_thread_cpu_snapshot(const char** names, uint64_t* ns, int max); // port/ps4_sampler.cpp
 +extern "C" void ps4_heap_usage(uint64_t* main_size, uint64_t* main_grown, uint64_t* overflow_size, uint64_t* overflow_grown); // port/ps4_runtime.cpp
 +extern "C" int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
@@ -1893,6 +1931,7 @@ index 8fdc8f3..019e203 100644
 +	struct Line
 +	{
 +		std::vector<std::pair<Kind, std::string>> tokens;
++		int maxRows = 1; // rows it may wrap to
 +		Line& operator()(Kind kind, std::string text) { tokens.emplace_back(kind, std::move(text)); return *this; }
 +	};
 +
@@ -2043,6 +2082,21 @@ index 8fdc8f3..019e203 100644
 +
 +	const char* Bool(bool value) { return value ? "true" : "false"; }
 +
++	// "1.2M" for rates
++	std::string Rate(double perSecond)
++	{
++		char text[32];
++		if (perSecond >= 1e6)
++			snprintf(text, sizeof(text), "%.2fM", perSecond / 1e6);
++		else if (perSecond >= 1e3)
++			snprintf(text, sizeof(text), "%.0fk", perSecond / 1e3);
++		else
++			snprintf(text, sizeof(text), "%.0f", perSecond);
++		return text;
++	}
++
++	// A tall panel on the left edge (the game's middle stays free): one variable per line, the log
++	// below, long lines wrapped.
 +	void Render(const Vector2f& window_size)
 +	{
 +		// ProggyClean is drawn crisp at multiples of 13 px: 26 px on a 1080p screen
@@ -2056,64 +2110,81 @@ index 8fdc8f3..019e203 100644
 +		int clients = 0;
 +		bool profilerOn = false;
 +		CremaLive_HudState(hudLine, lastResult, clients, profilerOn);
++		double callsPerSecond = 0.0, returnsPerSecond = 0.0;
++		const bool counting = CremaLive_BranchRates(callsPerSecond, returnsPerSecond);
 +
 +		const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 +		const bool blink = std::fmod(t, 1.0) < 0.55;
 +		const float charWidth = 7.0f * scale;
-+		const float panelWidth = std::floor(window_size.x * 0.60f);
++		const float panelWidth = std::floor(window_size.x * 0.34f);
++		const float margin = std::floor(fontSize * 0.5f);
 +		const size_t maxChars = (size_t)std::max(20.0f, (panelWidth - 2 * 14.0f) / charWidth) - 4; // minus line numbers
 +
++		auto member = [](Line& l, const char* name, Kind kind, std::string value, bool last = false) {
++			l(kPlain, "  ")(kProp, name)(kPunct, ": ")(kind, std::move(value))(kPunct, last ? "" : ",");
++		};
 +		std::vector<Line> lines;
-+		lines.push_back(Line()(kComment, "// CREMA LIVE :: Zelda BotW v208 :: PS4 Jaguar 8x1.6GHz :: tcp/7777"));
++		lines.push_back(Line()(kComment, "// CREMA LIVE :: tcp/7777"));
++		lines.push_back(Line()(kComment, "// zelda.botw v208 @ PS4 Jaguar 1.6GHz"));
 +		{
 +			constexpr double kGoal = 33.0;
-+			const int filled = (int)std::clamp(s_state.fps / kGoal * 16.0, 0.0, 16.0);
++			const int filled = (int)std::clamp(s_state.fps / kGoal * 14.0, 0.0, 14.0);
++			lines.push_back(Line()(kKeyword, "const ")(kIdent, "fps")(kPunct, " = ")(kNumber, Number(s_state.fps, 2))(kPunct, ";"));
++			lines.push_back(Line()(kComment, "// goal 33 [")(kAccent, std::string(filled, '#'))(kDim, std::string(14 - filled, '.'))
++				(kComment, "] ")(kNumber, std::to_string((int)(s_state.fps / kGoal * 100.0)))(kComment, "%"));
++		}
++		lines.push_back(Line()(kKeyword, "let ")(kIdent, "jit")(kPunct, " = {"));
++		{ Line l; member(l, "fast_cycles", kBool, Bool(g_crema_fast_cycles)); lines.push_back(l); }
++		{ Line l; member(l, "fast_shifts", kBool, Bool(g_crema_cl_shifts)); lines.push_back(l); }
++		{ Line l; member(l, "fast_cmp", kBool, Bool(g_crema_fast_compares)); lines.push_back(l); }
++		{ Line l; member(l, "ra_scan", kNumber, std::to_string(g_crema_ra_scan.load())); lines.push_back(l); }
++		{ Line l; member(l, "ra_budget", kNumber, std::to_string(g_crema_ra_budget.load())); lines.push_back(l); }
++		if (counting)
++		{
++			{ Line l; member(l, "calls_s", kNumber, Rate(callsPerSecond)); lines.push_back(l); }
++			{ Line l; member(l, "returns_s", kNumber, Rate(returnsPerSecond)); lines.push_back(l); }
++		}
++		{ Line l; member(l, "code_mb", kNumber, Number(g_crema_jit_code_bytes.load() / 1048576.0, 1), true); lines.push_back(l); }
++		lines.push_back(Line()(kPunct, "};"));
++		lines.push_back(Line()(kKeyword, "let ")(kIdent, "sched")(kPunct, " = { ")(kProp, "quantum")(kPunct, ": ")(kNumber, std::to_string(ppcThreadQuantum))(kPunct, " };"));
++		lines.push_back(Line()(kKeyword, "let ")(kIdent, "cpu")(kPunct, " = {")(kComment, "  // % busy"));
++		for (size_t i = 0; i < s_state.busy.size(); i++)
++		{
++			const int percent = s_state.busy[i].second;
 +			Line l;
-+			l(kKeyword, "const ")(kIdent, "fps")(kPunct, " = ")(kNumber, Number(s_state.fps, 2))(kPunct, ";")
-+				(kComment, "   // goal ")(kNumber, Number(kGoal, 2))(kComment, "  [")(kAccent, std::string(filled, '#'))
-+				(kDim, std::string(16 - filled, '.'))(kComment, "] ")(kNumber, std::to_string((int)(s_state.fps / kGoal * 100.0)))(kComment, "%");
++			member(l, s_state.busy[i].first.c_str(), percent >= 95 ? kWarn : kNumber, std::to_string(percent), i + 1 == s_state.busy.size());
 +			lines.push_back(l);
 +		}
-+		lines.push_back(Line()(kKeyword, "let ")(kIdent, "jit")(kPunct, ".")(kProp, "fast_cycles")(kPunct, " = ")(kBool, Bool(g_crema_fast_cycles))(kPunct, ";  ")
-+			(kIdent, "jit")(kPunct, ".")(kProp, "cl_shifts")(kPunct, " = ")(kBool, Bool(g_crema_cl_shifts))(kPunct, ";  ")
-+			(kIdent, "jit")(kPunct, ".")(kProp, "fast_cmp")(kPunct, " = ")(kBool, Bool(g_crema_fast_compares))(kPunct, ";"));
-+		lines.push_back(Line()(kKeyword, "let ")(kIdent, "jit")(kPunct, ".")(kProp, "ra_scan")(kPunct, " = ")(kNumber, std::to_string(g_crema_ra_scan.load()))(kPunct, ";  ")
-+			(kIdent, "jit")(kPunct, ".")(kProp, "ra_budget")(kPunct, " = ")(kNumber, std::to_string(g_crema_ra_budget.load()))(kPunct, ";  ")
-+			(kIdent, "jit")(kPunct, ".")(kProp, "code_mb")(kPunct, " = ")(kNumber, Number(g_crema_jit_code_bytes.load() / 1048576.0, 1))(kPunct, ";"));
-+		lines.push_back(Line()(kKeyword, "let ")(kIdent, "sched")(kPunct, ".")(kProp, "quantum")(kPunct, " = ")(kNumber, std::to_string(ppcThreadQuantum))(kPunct, ";  ")
-+			(kIdent, "sched")(kPunct, ".")(kProp, "fairness")(kPunct, " = ")(kBool, Bool(coreinit::g_crema_thread_fairness.load()))(kPunct, ";  ")
-+			(kIdent, "profiler")(kPunct, " = ")(kBool, Bool(profilerOn))(kPunct, ";"));
++		lines.push_back(Line()(kPunct, "};"));
++		lines.push_back(Line()(kKeyword, "let ")(kIdent, "mem")(kPunct, " = {")(kComment, "  // MiB"));
++		{ Line l; member(l, "heap", s_state.heapSize && s_state.heapGrown * 100 >= s_state.heapSize * 95 ? kWarn : kNumber,
++			std::to_string(s_state.heapGrown >> 20) + "/" + std::to_string(s_state.heapSize >> 20)); lines.push_back(l); }
++		{ Line l; member(l, "overflow", s_state.overflowSize ? kWarn : kNumber, std::to_string(s_state.overflowGrown >> 20)); lines.push_back(l); }
++		{ Line l; member(l, "flex_free", kNumber, std::to_string(s_state.flexibleFree >> 20), true); lines.push_back(l); }
++		lines.push_back(Line()(kPunct, "};"));
++		if (!hudLine.empty())
 +		{
 +			Line l;
-+			l(kKeyword, "let ")(kIdent, "cpu")(kPunct, " = { ");
-+			for (size_t i = 0; i < s_state.busy.size(); i++)
-+			{
-+				const int percent = s_state.busy[i].second;
-+				l(kProp, s_state.busy[i].first)(kPunct, ": ")(percent >= 95 ? kWarn : kNumber, std::to_string(percent))(kPunct, i + 1 < s_state.busy.size() ? ", " : "");
-+			}
-+			l(kPunct, " };")(kComment, "  // % busy");
++			l(kHud, ">> " + hudLine)(kHud, blink ? "_" : " ");
++			l.maxRows = 2;
 +			lines.push_back(l);
 +		}
-+		lines.push_back(Line()(kKeyword, "let ")(kIdent, "mem")(kPunct, " = { ")(kProp, "heap")(kPunct, ": ")
-+			(s_state.heapSize && s_state.heapGrown * 100 >= s_state.heapSize * 95 ? kWarn : kNumber, std::to_string(s_state.heapGrown >> 20))
-+			(kPunct, "/")(kNumber, std::to_string(s_state.heapSize >> 20))(kPunct, ", ")(kProp, "overflow")(kPunct, ": ")
-+			(s_state.overflowSize ? kWarn : kNumber, std::to_string(s_state.overflowGrown >> 20))(kPunct, ", ")(kProp, "flex_free")(kPunct, ": ")
-+			(kNumber, std::to_string(s_state.flexibleFree >> 20))(kPunct, " };")(kComment, "  // MiB"));
-+		if (!g_crema_overlay_header.empty())
-+			lines.push_back(Line()(kComment, "// " + g_crema_overlay_header));
-+		if (!hudLine.empty())
-+			lines.push_back(Line()(kHud, ">> " + hudLine)(kHud, blink ? "_" : " "));
 +		if (!lastResult.empty())
 +			lines.push_back(Line()(kAccent, "$ ")(kDim, lastResult));
-+		lines.push_back(Line()(kComment, clients > 0 ? "// log.txt  (a computer is connected)" : "// log.txt"));
-+		// the newest log lines, without the controllers' motion readings (one every 10 s)
-+		constexpr size_t kLogLines = 11;
++		lines.push_back(Line()(kComment, clients > 0 ? "// log.txt (pc connected)" : "// log.txt"));
++		// the newest log lines, without the controllers' motion readings (one every 10 s); the
++		// time as mm:ss
++		constexpr size_t kLogLines = 5;
 +		const std::vector<std::string> log = cemuLog_recentLines();
-+		std::vector<std::string_view> shown;
++		std::vector<std::string> shown;
 +		for (auto it = log.rbegin(); it != log.rend() && shown.size() < kLogLines; ++it)
 +		{
-+			if (it->find("PS4Pad: motion") == std::string::npos)
-+				shown.emplace_back(*it);
++			if (it->find("PS4Pad: motion") != std::string::npos)
++				continue;
++			std::string text = *it;
++			if (text.size() > 14 && text[0] == '[' && text[13] == ']')
++				text = "[" + text.substr(4, 5) + "]" + text.substr(14);
++			shown.emplace_back(std::move(text));
 +		}
 +		for (auto it = shown.rbegin(); it != shown.rend(); ++it)
 +			lines.push_back(LexLog(*it));
@@ -2125,13 +2196,13 @@ index 8fdc8f3..019e203 100644
 +		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
 +		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
 +		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 2.0f));
-+		ImGui::SetNextWindowPos({fontSize, window_size.y - fontSize}, ImGuiCond_Always, {0.0f, 1.0f});
-+		ImGui::SetNextWindowSizeConstraints({panelWidth, 0.0f}, {panelWidth, window_size.y * 0.9f});
++		ImGui::SetNextWindowPos({margin, margin}, ImGuiCond_Always, {0.0f, 0.0f});
++		ImGui::SetNextWindowSizeConstraints({panelWidth, 0.0f}, {panelWidth, window_size.y - 2 * margin});
 +		const ImGuiWindowFlags flags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
 +			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
 +		if (ImGui::Begin("Crema Live", nullptr, flags))
 +		{
-+			// title bar of an editor: three dots, the file name, LIVE when a computer is connected
++			// title bar of an editor: three dots, the file name, the frame rate graph, LIVE
 +			ImDrawList* draw = ImGui::GetWindowDrawList();
 +			const ImVec2 pos = ImGui::GetWindowPos();
 +			const float barHeight = fontSize + 8.0f;
@@ -2141,7 +2212,8 @@ index 8fdc8f3..019e203 100644
 +			draw->AddCircleFilled({pos.x + 16.0f, cy}, r, IM_COL32(255, 95, 86, 255));
 +			draw->AddCircleFilled({pos.x + 16.0f + r * 3.2f, cy}, r, IM_COL32(255, 189, 46, 255));
 +			draw->AddCircleFilled({pos.x + 16.0f + r * 6.4f, cy}, r, IM_COL32(39, 201, 63, 255));
-+			draw->AddText({pos.x + 16.0f + r * 9.0f, pos.y + 4.0f}, ImGui::GetColorU32(kColors[kPlain]), "crema_live.cpp  --  zelda.botw");
++			const float nameX = pos.x + 16.0f + r * 9.0f;
++			draw->AddText({nameX, pos.y + 4.0f}, ImGui::GetColorU32(kColors[kPlain]), "crema_live.cpp");
 +			const char* liveText = clients > 0 ? "LIVE" : "idle";
 +			const ImVec2 liveSize = ImGui::CalcTextSize(liveText);
 +			const float liveX = pos.x + panelWidth - liveSize.x - 18.0f;
@@ -2149,11 +2221,11 @@ index 8fdc8f3..019e203 100644
 +				draw->AddCircleFilled({liveX - r * 2.0f, cy}, r * (blink ? 1.0f : 0.6f), IM_COL32(255, 60, 60, 255));
 +			draw->AddText({liveX, pos.y + 4.0f}, ImGui::GetColorU32(clients > 0 ? kColors[kWarn] : kColors[kDim]), liveText);
 +			// the frame rate of the last 32 s, 0 to 40 FPS, with the 33 FPS goal dashed
-+			if (s_state.fpsSamples > 1)
++			const float graphLeft = nameX + ImGui::CalcTextSize("crema_live.cpp").x + 14.0f;
++			const float graphRight = liveX - r * 4.0f - 10.0f;
++			if (s_state.fpsSamples > 1 && graphRight - graphLeft > 40.0f)
 +			{
-+				const float graphRight = liveX - r * 4.0f - 12.0f;
-+				const float graphWidth = std::min(panelWidth * 0.30f, 64.0f * 5.0f * scale * 0.5f);
-+				const float graphLeft = graphRight - graphWidth;
++				const float graphWidth = graphRight - graphLeft;
 +				const float top = pos.y + 4.0f, bottom = pos.y + barHeight - 4.0f;
 +				auto yOf = [&](float fps) { return bottom - std::clamp(fps / 40.0f, 0.0f, 1.0f) * (bottom - top); };
 +				for (float x = graphLeft; x < graphRight; x += 8.0f)
@@ -2167,28 +2239,39 @@ index 8fdc8f3..019e203 100644
 +						draw->AddLine(previous, point, ImGui::GetColorU32(kColors[kNumber]), 2.0f);
 +					previous = point;
 +				}
-+				const std::string label = Number(s_state.fps, 1) + " fps";
-+				const ImVec2 labelSize = ImGui::CalcTextSize(label.c_str());
-+				draw->AddText({graphLeft - labelSize.x - 10.0f, pos.y + 4.0f}, ImGui::GetColorU32(kColors[kNumber]), label.c_str());
 +			}
 +			ImGui::Dummy({0.0f, barHeight});
 +
-+			for (size_t n = 0; n < lines.size(); n++)
++			// lines with their numbers; a long one wraps under itself (two rows at most)
++			size_t number = 0;
++			for (const Line& line : lines)
 +			{
-+				char number[8];
-+				snprintf(number, sizeof(number), "%2zu  ", n + 1);
-+				ImGui::TextColored(kColors[kDim], "%s", number);
++				char label[8];
++				snprintf(label, sizeof(label), "%2zu  ", ++number);
++				ImGui::TextColored(kColors[kDim], "%s", label);
 +				size_t used = 0;
-+				for (const auto& [kind, text] : lines[n].tokens)
++				int rows = 1;
++				for (const auto& [kind, text] : line.tokens)
 +				{
-+					if (used >= maxChars)
-+						break;
-+					const size_t take = std::min(text.size(), maxChars - used);
-+					ImGui::SameLine(0.0f, 0.0f);
-+					ImGui::PushStyleColor(ImGuiCol_Text, kColors[kind]);
-+					ImGui::TextUnformatted(text.data(), text.data() + take);
-+					ImGui::PopStyleColor();
-+					used += take;
++					std::string_view rest(text);
++					while (!rest.empty())
++					{
++						if (used >= maxChars)
++						{
++							if (rows >= line.maxRows)
++								break;
++							rows++;
++							used = 0;
++							ImGui::TextColored(kColors[kDim], "    ");
++						}
++						const size_t take = std::min(rest.size(), maxChars - used);
++						ImGui::SameLine(0.0f, 0.0f);
++						ImGui::PushStyleColor(ImGuiCol_Text, kColors[kind]);
++						ImGui::TextUnformatted(rest.data(), rest.data() + take);
++						ImGui::PopStyleColor();
++						used += take;
++						rest.remove_prefix(take);
++					}
 +				}
 +			}
 +		}
@@ -2208,7 +2291,7 @@ index 8fdc8f3..019e203 100644
  void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 direction, float fontSize, bool pad)
  {
  	auto& config = GetConfig();
-@@ -517,7 +877,7 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
+@@ -517,7 +923,7 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
  void LatteOverlay_render(bool pad_view)
  {
  	const auto& config = GetConfig();
@@ -2217,7 +2300,7 @@ index 8fdc8f3..019e203 100644
  		return;
  
  	sint32 w = 0, h = 0;
-@@ -561,6 +921,9 @@ void LatteOverlay_render(bool pad_view)
+@@ -561,6 +967,9 @@ void LatteOverlay_render(bool pad_view)
  
  		LatteOverlay_RenderNotifications(position, pivot, direction, notificationsFontSize, pad_view);
  	}
@@ -5067,17 +5150,19 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..4816be3
+index 0000000..03b3cdc
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,404 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
 +// A TCP server on port 7777 takes one text command per line and answers with one line:
 +//   get                     current values
 +//   set <name> <value>      fast_cycles, cl_shifts, fast_compares (0/1), ra_budget, ra_scan,
-+//                           quantum (numbers), fairness (0/1)
++//                           quantum (numbers), fairness (0/1), count_branches (0/1: code compiled
++//                           afterwards counts guest calls and returns)
++//   branches                calls and returns per second since the last "branches"
 +//   fps <seconds>           frame rate over that time (waits) and the CPU use of the busy threads:
 +//                           "fps 22.91 frames 687 secs 30.0 | LatteThread 90% ..."
 +//   prof on|off             the sampling profiler (needed by "hot"; costs a little speed)
@@ -5116,6 +5201,8 @@ index 0000000..4816be3
 +extern std::atomic<uint64> g_crema_ra_budget; // Recompiler/IML/IMLRegisterAllocator.cpp
 +extern std::atomic<sint32> g_crema_ra_scan;
 +extern std::atomic<uint64> g_crema_jit_code_bytes; // Recompiler/BackendX64/BackendX64.cpp
++extern std::atomic<bool> g_crema_count_branches; // Recompiler/BackendX64/BackendX64.cpp
++extern uint64 g_crema_branch_counts[2];
 +extern std::atomic<uint64_t> g_crema_presents; // HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp
 +extern "C" int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
@@ -5145,10 +5232,10 @@ index 0000000..4816be3
 +	std::string Values()
 +	{
 +		char line[256];
-+		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d prof=%d",
++		snprintf(line, sizeof(line), "fast_cycles=%d cl_shifts=%d fast_compares=%d ra_budget=%llu ra_scan=%d quantum=%u fairness=%d count_branches=%d prof=%d",
 +			g_crema_fast_cycles ? 1 : 0, g_crema_cl_shifts ? 1 : 0, g_crema_fast_compares ? 1 : 0,
 +			(unsigned long long)g_crema_ra_budget.load(), (int)g_crema_ra_scan.load(), ppcThreadQuantum,
-+			coreinit::g_crema_thread_fairness.load() ? 1 : 0, s_profilerOn.load() ? 1 : 0);
++			coreinit::g_crema_thread_fairness.load() ? 1 : 0, g_crema_count_branches.load() ? 1 : 0, s_profilerOn.load() ? 1 : 0);
 +		return line;
 +	}
 +
@@ -5169,6 +5256,8 @@ index 0000000..4816be3
 +			ppcThreadQuantum = (uint32)number;
 +		else if (name == "fairness")
 +			coreinit::g_crema_thread_fairness = number != 0;
++		else if (name == "count_branches")
++			g_crema_count_branches = number != 0;
 +		else
 +			return "error: unknown setting or value: " + name + " " + value;
 +		cemuLog_log(LogType::Force, "Crema Live: {} = {}", name, value);
@@ -5255,6 +5344,30 @@ index 0000000..4816be3
 +		return text;
 +	}
 +
++	// calls and returns per second between two reads (one reader per state)
++	struct BranchRateState
++	{
++		std::chrono::steady_clock::time_point time{};
++		uint64 counts[2]{};
++		double rates[2]{};
++		bool Sample(double minSeconds)
++		{
++			const auto now = std::chrono::steady_clock::now();
++			const double elapsed = std::chrono::duration<double>(now - time).count();
++			if (time != std::chrono::steady_clock::time_point{} && elapsed < minSeconds)
++				return false;
++			for (int i = 0; i < 2; i++)
++			{
++				const uint64 c = g_crema_branch_counts[i];
++				rates[i] = time == std::chrono::steady_clock::time_point{} ? 0.0 : (c - counts[i]) / elapsed;
++				counts[i] = c;
++			}
++			time = now;
++			return true;
++		}
++	};
++	BranchRateState s_commandRates;
++
 +	std::string Command(const std::string& text)
 +	{
 +		std::istringstream in(text);
@@ -5315,6 +5428,15 @@ index 0000000..4816be3
 +		}
 +		if (cmd == "mem")
 +			return Memory();
++		if (cmd == "branches")
++		{
++			s_commandRates.Sample(0.0);
++			char line[160];
++			snprintf(line, sizeof(line), "calls/s %.0f returns/s %.0f total_calls %llu total_returns %llu",
++				s_commandRates.rates[0], s_commandRates.rates[1],
++				(unsigned long long)s_commandRates.counts[0], (unsigned long long)s_commandRates.counts[1]);
++			return line;
++		}
 +		if (cmd == "hud")
 +		{
 +			std::string rest;
@@ -5332,7 +5454,7 @@ index 0000000..4816be3
 +			cemuLog_log(LogType::Force, "Crema Live mark:{}", rest);
 +			return "ok";
 +		}
-+		return "error: commands get, set, fps, prof, hot, inval, flush, mem, hud, mark";
++		return "error: commands get, set, fps, prof, hot, inval, flush, mem, branches, hud, mark";
 +	}
 +
 +	void Serve(int client)
@@ -5422,6 +5544,19 @@ index 0000000..4816be3
 +	lastResult = s_lastResult;
 +	clients = s_clients.load();
 +	profilerOn = s_profilerOn.load();
++}
++
++// For the Live Log panel: calls and returns per second (updated every second); false while the
++// counting is off
++bool CremaLive_BranchRates(double& callsPerSecond, double& returnsPerSecond)
++{
++	static BranchRateState s_hudRates; // the panel's own (render thread)
++	if (!g_crema_count_branches.load(std::memory_order_relaxed))
++		return false;
++	s_hudRates.Sample(1.0);
++	callsPerSecond = s_hudRates.rates[0];
++	returnsPerSecond = s_hudRates.rates[1];
++	return true;
 +}
 diff --git a/src/gui/ps4/CremaMii.cpp b/src/gui/ps4/CremaMii.cpp
 new file mode 100644
