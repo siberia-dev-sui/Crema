@@ -5202,10 +5202,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..7e56e52
+index 0000000..9431629
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,457 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -5224,6 +5224,8 @@ index 0000000..7e56e52
 +//   inval <addr> [...]      recompile the game functions holding these guest addresses (hex)
 +//   flush                   recompile every game function (each flush keeps the old code: ~60-100 MB)
 +//   mem                     flexible memory left, heaps and generated code
++//   membench                time of one read per 16 KiB page over 64 MiB of the guest's RAM (TLB
++//                           misses: about the page size the guest's memory is mapped with)
 +//   hud <text>              a line for the Live Log panel (empty: none)
 +//   mark <text>             a line in log.txt
 +// Recompiler settings only apply to code compiled afterwards: "inval" the hot functions (or
@@ -5265,6 +5267,7 @@ index 0000000..7e56e52
 +	std::string CremaLive_SetAffinity(const std::string& pattern, uint32 mask);
 +}
 +extern "C" int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
++extern uint8* memory_base; // Cafe/HW/MMU/MMU.cpp
 +// port/ps4_sampler.cpp and port/ps4_runtime.cpp
 +extern "C" void ps4_sampler_set_enabled(int on);
 +extern "C" int ps4_sampler_hot(uint32_t* functions, uint32_t* samples, int max, int reset);
@@ -5386,6 +5389,38 @@ index 0000000..7e56e52
 +		return line;
 +	}
 +
++	// One read per 16 KiB page of 64 MiB of MEM2 (0x10000000), pages in a fixed random order: the
++	// data (4096 cache lines) stays in the caches, the pages don't fit in the TLB unless large
++	std::string MemBench()
++	{
++		constexpr uint32 kBase = 0x10000000, kPages = 4096, kPage = 16 * 1024, kRounds = 64;
++		static std::vector<uint32> s_order;
++		if (s_order.empty())
++		{
++			s_order.resize(kPages);
++			for (uint32 i = 0; i < kPages; i++)
++				s_order[i] = i;
++			uint32 seed = 12345;
++			for (uint32 i = kPages - 1; i > 0; i--)
++			{
++				seed = seed * 1103515245u + 12345u;
++				std::swap(s_order[i], s_order[seed % (i + 1)]);
++			}
++		}
++		const volatile uint8* base = memory_base + kBase;
++		uint32 sum = 0;
++		for (uint32 i = 0; i < kPages; i++) // warm the caches
++			sum += base[s_order[i] * kPage + (i & 63) * 64];
++		const auto t0 = std::chrono::steady_clock::now();
++		for (uint32 r = 0; r < kRounds; r++)
++			for (uint32 i = 0; i < kPages; i++)
++				sum += base[s_order[i] * kPage + (i & 63) * 64];
++		const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / (kRounds * kPages);
++		char line[128];
++		snprintf(line, sizeof(line), "membench %.2f ns per read (%u pages of 16 KiB, checksum %u)", ns, kPages, sum & 0xFF);
++		return line;
++	}
++
 +	std::string Hot(int count)
 +	{
 +		if (!s_profilerOn)
@@ -5487,6 +5522,8 @@ index 0000000..7e56e52
 +		}
 +		if (cmd == "mem")
 +			return Memory();
++		if (cmd == "membench")
++			return MemBench();
 +		if (cmd == "threads")
 +			return coreinit::CremaLive_ThreadList();
 +		if (cmd == "affinity")
@@ -5522,7 +5559,7 @@ index 0000000..7e56e52
 +			cemuLog_log(LogType::Force, "Crema Live mark:{}", rest);
 +			return "ok";
 +		}
-+		return "error: commands get, set, fps, prof, hot, inval, flush, mem, branches, threads, affinity, hud, mark";
++		return "error: commands get, set, fps, prof, hot, inval, flush, mem, membench, branches, threads, affinity, hud, mark";
 +	}
 +
 +	void Serve(int client)
@@ -15720,10 +15757,10 @@ index 0000000..85c226d
 +}
 diff --git a/src/util/MemMapper/MemMapperPS4.cpp b/src/util/MemMapper/MemMapperPS4.cpp
 new file mode 100644
-index 0000000..ff346d0
+index 0000000..7ae80d9
 --- /dev/null
 +++ b/src/util/MemMapper/MemMapperPS4.cpp
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,266 @@
 +// PS4 memory mapping. Large PROT_NONE mmaps fail on the PS4 (4 GiB+ is ENOMEM) and regular
 +// flexible memory is only ~255 MiB, so:
 +//  - reservations come from sceKernelReserveVirtualRange (placed away from 0x200000000, where
@@ -15736,6 +15773,9 @@ index 0000000..ff346d0
 +
 +#include <sys/mman.h>
 +#include <sys/types.h>
++
++#include <algorithm>
++#include <cstdio>
 +
 +extern "C"
 +{
@@ -15845,6 +15885,47 @@ index 0000000..ff346d0
 +		}
 +	}
 +
++	// Crema experiment (/data/Crema/largepages.txt holding "1"): a committed run that covers whole
++	// 2 MiB-aligned blocks maps them from 2 MiB-aligned direct memory, so the CPU can use 2 MiB
++	// pages there (the guest's RAM, the recompiler's jump table): far fewer TLB misses than with
++	// 16 KiB pages when the game walks large data.
++	constexpr size_t kLargePage = 2 * 1024 * 1024;
++	static bool LargePages()
++	{
++		static const bool s_on = [] {
++			bool on = false;
++			if (FILE* f = fopen("/data/Crema/largepages.txt", "rb"))
++			{
++				on = fgetc(f) == '1';
++				fclose(f);
++			}
++			return on;
++		}();
++		return s_on;
++	}
++
++	// Maps [addr, addr + len) from new direct memory with the given alignment; false if impossible.
++	static bool MapNew(uintptr_t addr, size_t len, size_t align, int32_t prot, off_t& physOut)
++	{
++		off_t phys = 0;
++		int32_t r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), len, align, kMemoryTypeWbOnion, &phys);
++		if (r != 0)
++		{
++			cemuLog_log(LogType::Force, "MemMapper: out of direct memory for {:#x} bytes ({:#x})", len, (uint32)r);
++			return false;
++		}
++		void* mapped = (void*)addr;
++		r = sceKernelMapDirectMemory(&mapped, len, prot | kProtCpuRead | kProtCpuWrite, kMapFixed, phys, align);
++		if (r != 0 || mapped != (void*)addr)
++		{
++			cemuLog_log(LogType::Force, "MemMapper: mapping {:#x} bytes at {:#x} failed ({:#x})", len, addr, (uint32)r);
++			sceKernelReleaseDirectMemory(phys, len);
++			return false;
++		}
++		physOut = phys;
++		return true;
++	}
++
 +	// Commits pages [first, last) of a reservation that aren't committed yet, run by run.
 +	static bool CommitPages(Reservation& res, size_t first, size_t last, int32_t prot)
 +	{
@@ -15860,28 +15941,40 @@ index 0000000..ff346d0
 +			size_t runEnd = i;
 +			while (runEnd < last && res.phys[runEnd] == kNotCommitted)
 +				runEnd++;
-+			const size_t len = (runEnd - i) * kPage;
-+			off_t phys = 0;
-+			int32_t r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), len, kPage, kMemoryTypeWbOnion, &phys);
-+			if (r != 0)
++			// the run in pieces: 2 MiB-aligned whole blocks (large pages, when on), 16 KiB pages around them
++			while (i < runEnd)
 +			{
-+				cemuLog_log(LogType::Force, "MemMapper: out of direct memory for {:#x} bytes ({:#x})", len, (uint32)r);
-+				return false;
++				const uintptr_t addr = res.base + i * kPage;
++				const size_t left = (runEnd - i) * kPage;
++				size_t len;
++				size_t align = kPage;
++				if (LargePages() && (addr & (kLargePage - 1)) == 0 && left >= kLargePage)
++				{
++					len = left & ~(kLargePage - 1);
++					align = kLargePage;
++				}
++				else if (LargePages())
++				{
++					// up to the next 2 MiB boundary (or the end of the run)
++					const uintptr_t next = (addr + kLargePage) & ~(uintptr_t)(kLargePage - 1);
++					len = std::min(left, (size_t)(next - addr));
++				}
++				else
++					len = left;
++				off_t phys = 0;
++				if (!MapNew(addr, len, align, prot, phys))
++				{
++					if (align == kPage || !MapNew(addr, len, kPage, prot, phys))
++						return false;
++				}
++				memset((void*)addr, 0, len); // direct memory isn't zeroed; committed memory must read as zero
++				if ((prot & kProtCpuWrite) == 0)
++					sceKernelMprotect((void*)addr, len, prot);
++				const size_t pages = len / kPage;
++				for (size_t p = 0; p < pages; p++)
++					res.phys[i + p] = phys + (off_t)(p * kPage);
++				i += pages;
 +			}
-+			void* addr = (void*)(res.base + i * kPage);
-+			r = sceKernelMapDirectMemory(&addr, len, prot | kProtCpuRead | kProtCpuWrite, kMapFixed, phys, kPage);
-+			if (r != 0 || addr != (void*)(res.base + i * kPage))
-+			{
-+				cemuLog_log(LogType::Force, "MemMapper: mapping {:#x} bytes at {:#x} failed ({:#x})", len, res.base + i * kPage, (uint32)r);
-+				sceKernelReleaseDirectMemory(phys, len);
-+				return false;
-+			}
-+			memset(addr, 0, len); // direct memory isn't zeroed; committed memory must read as zero
-+			if ((prot & kProtCpuWrite) == 0)
-+				sceKernelMprotect(addr, len, prot);
-+			for (size_t p = i; p < runEnd; p++)
-+				res.phys[p] = phys + (off_t)((p - i) * kPage);
-+			i = runEnd;
 +		}
 +		return true;
 +	}
