@@ -3227,10 +3227,10 @@ index 743ab67..bc6b5cd 100644
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..215369e
+index 0000000..c1cecb1
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,572 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -3258,6 +3258,9 @@ index 0000000..215369e
 +// own thread (VulkanRecorderPS4.cpp) the present runs there later, and an acquire must still wait
 +// for the image the renderer's previous presents put on screen.
 +std::atomic<uint64_t> g_crema_presents_issued{0};
++extern std::atomic<bool> g_crema_framegen; // VulkanFrameGenPS4.cpp
++// Crema Live "fgdump": the next presents saved at half size to /data/Crema/fg-<n>.raw (RGBA)
++std::atomic<int> g_crema_fg_dump{0};
 +thread_local bool t_crema_present_counted = false; // set by the recording thread around a present it replays
 +void PS4WSI_CountIssuedPresents(uint32 count) { g_crema_presents_issued.fetch_add(count, std::memory_order_relaxed); }
 +void PS4WSI_SetPresentCounted(bool counted) { t_crema_present_counted = counted; }
@@ -3283,6 +3286,8 @@ index 0000000..215369e
 +		int firstBuffer = 0;
 +		uint32 nextImage = 0;
 +		uint32 flipMode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
++		const uint8* pixels[kMaxImages]{}; // the mapped images (Crema Live fgdump)
++		uint32 pitch = 0; // in pixels
 +	};
 +
 +	VkInstance sInstance = VK_NULL_HANDLE;
@@ -3542,6 +3547,8 @@ index 0000000..215369e
 +			getLayout(device, sc->images[i], &sub, &layout);
 +			addresses[i] = base + offset + layout.offset;
 +			pitch = (uint32)(layout.rowPitch / 4);
++			sc->pixels[i] = (const uint8*)addresses[i];
++			sc->pitch = pitch;
 +		}
 +		OrbisVideoOutBufferAttribute attribute;
 +		sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, kWidth, kHeight, pitch);
@@ -3684,6 +3691,9 @@ index 0000000..215369e
 +			si.pWaitDstStageMask = stages.data();
 +			const uint32 buffer = (uint32)sc->firstBuffer + info->pImageIndices[i];
 +			const sint64 arg = (sint64)(sFlipsSubmitted + 1);
++			// frame generation shows two frames per game frame: each needs a whole refresh, an
++			// immediate flip would replace the in-between frame almost at once (a torn band)
++			const uint32 flipMode = g_crema_framegen.load(std::memory_order_relaxed) ? (uint32)ORBIS_VIDEO_OUT_FLIP_VSYNC : sc->flipMode;
 +			int r;
 +			if (si.waitSemaphoreCount)
 +			{
@@ -3692,13 +3702,13 @@ index 0000000..215369e
 +					cemuLog_log(LogType::Force, "PS4WSI: present semaphore submit failed: {}", (sint32)sr);
 +			}
 +			// the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
-+			r = ac_ps4_submit_flip(sVideo, buffer, sc->flipMode, arg);
++			r = ac_ps4_submit_flip(sVideo, buffer, flipMode, arg);
 +			const bool gpuFlip = r == 0;
 +			if (!gpuFlip)
 +			{
 +				// fallback: wait for the GPU on the CPU, then flip
 +				Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
-+				r = sceVideoOutSubmitFlip(sVideo, (sint32)buffer, sc->flipMode, arg);
++				r = sceVideoOutSubmitFlip(sVideo, (sint32)buffer, flipMode, arg);
 +			}
 +			if (r < 0)
 +			{
@@ -3714,6 +3724,32 @@ index 0000000..215369e
 +			}
 +			if (info->pResults)
 +				info->pResults[i] = r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
++			if (g_crema_fg_dump.load(std::memory_order_relaxed) > 0 && sc->pixels[info->pImageIndices[i]])
++			{
++				// once the GPU is done with the image: a 2x2 average per pixel, 960x540 RGBA
++				Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
++				const int n = 4 - g_crema_fg_dump.fetch_sub(1);
++				char path[64];
++				snprintf(path, sizeof(path), "/data/Crema/fg-%d.raw", n);
++				if (FILE* f = fopen(path, "wb"))
++				{
++					const uint8* src = sc->pixels[info->pImageIndices[i]];
++					std::vector<uint8> row(kWidth / 2 * 4);
++					for (uint32 y = 0; y < kHeight; y += 2)
++					{
++						for (uint32 x = 0; x < kWidth; x += 2)
++							for (uint32 c = 0; c < 4; c++)
++							{
++								const uint8* p = src + ((size_t)y * sc->pitch + x) * 4 + c;
++								const size_t down = (size_t)sc->pitch * 4;
++								row[x / 2 * 4 + c] = (uint8)((p[0] + p[4] + p[down] + p[down + 4] + 2) / 4);
++							}
++						fwrite(row.data(), 1, row.size(), f);
++					}
++					fclose(f);
++					cemuLog_log(LogType::Force, "PS4WSI: present saved to {}", path);
++				}
++			}
 +		}
 +		return result;
 +	}
@@ -7638,10 +7674,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..1fbe2c5
+index 0000000..1dac986
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,556 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -7706,6 +7742,7 @@ index 0000000..1fbe2c5
 +extern std::atomic<uint64_t> g_crema_game_frames; // HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +extern std::atomic<bool> g_crema_framegen; // HW/Latte/Renderer/Vulkan/VulkanFrameGenPS4.cpp
 +constexpr int kCremaFgParamCount = 7; // VulkanFrameGenPS4.h: CremaFgParam, in this order
++extern std::atomic<int> g_crema_fg_dump; // HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 +extern std::atomic<float> g_crema_fg_params[kCremaFgParamCount];
 +namespace coreinit
 +{
@@ -8011,6 +8048,12 @@ index 0000000..1fbe2c5
 +			PPCRecompiler_invalidateRange(PPC_REC_CODE_AREA_START, PPC_REC_CODE_AREA_END);
 +			cemuLog_log(LogType::Force, "Crema Live: recompiling every function");
 +			return "ok";
++		}
++		if (cmd == "fgdump")
++		{
++			// the next 4 presents (with frame generation: in-between, game, in-between, game)
++			g_crema_fg_dump = 4;
++			return "ok: /data/Crema/fg-0.raw .. fg-3.raw (960x540 RGBA) in a moment";
 +		}
 +		if (cmd == "mem")
 +			return Memory();
