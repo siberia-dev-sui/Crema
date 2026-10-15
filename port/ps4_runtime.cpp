@@ -747,7 +747,38 @@ void* mapLargeExecutable(size_t len) {
         heapLog("[cemu] mmap: no 2 MiB-aligned direct memory for %zu KiB of code\n", size / 1024);
         return nullptr;
     }
+    // the first block must run code; if it doesn't, the experiment turns itself off
+    auto accept = [&](void* base) -> bool {
+        static bool s_checked = false;
+        if (s_checked)
+            return true;
+        s_checked = true;
+        if (!runsCode(base)) {
+            heapLog("[cemu] executable memory: 2 MiB-aligned direct memory does not run code, experiment off\n");
+            g_largeCode = 0;
+            return false;
+        }
+        heapLog("[cemu] executable memory: recompiler code in 2 MiB-aligned direct memory at %p (largecode.txt)\n", base);
+        return true;
+    };
     const uintptr_t hints[] = {0x1400000000ull, 0x1000000000ull, 0x800000000ull};
+    // as the large heap does it (that works): a hint, no reservation
+    for (uintptr_t hint : hints) {
+        void* base = reinterpret_cast<void*>(hint);
+        const int32_t mapped = sceKernelMapDirectMemory(&base, size, PROT_CPU_RWX, 0, phys, 2 * MB);
+        if (mapped == 0 && reinterpret_cast<uintptr_t>(base) >= 0x400000000ull) {
+            if (accept(base))
+                return base;
+            sceKernelMunmap(base, size);
+            sceKernelReleaseDirectMemory(phys, size);
+            return nullptr;
+        }
+        heapLog("[cemu] executable memory: 2 MiB-aligned direct memory not mapped RWX near %p (0x%x, got %p)\n",
+                reinterpret_cast<void*>(hint), mapped, base);
+        if (mapped == 0)
+            sceKernelMunmap(base, size);
+    }
+    // a reserved 2 MiB-aligned range, mapped over
     for (uintptr_t hint : hints) {
         void* address = reinterpret_cast<void*>(hint);
         const int32_t reserved = sceKernelReserveVirtualRange(&address, size, 0, 2 * MB);
@@ -763,19 +794,14 @@ void* mapLargeExecutable(size_t len) {
             sceKernelMunmap(address, size);
             continue;
         }
-        static bool s_checked = false;
-        if (!s_checked) {
-            s_checked = true;
-            if (!runsCode(base)) {
-                heapLog("[cemu] executable memory: 2 MiB-aligned direct memory does not run code, experiment off\n");
-                sceKernelMunmap(base, size);
-                sceKernelReleaseDirectMemory(phys, size);
-                g_largeCode = 0;
-                return nullptr;
-            }
-            heapLog("[cemu] executable memory: recompiler code in 2 MiB-aligned direct memory (largecode.txt)\n");
-        }
-        return base;
+        if (accept(base))
+            return base;
+        sceKernelMunmap(base, size);
+        break;
+    }
+    if (g_largeCode) {
+        heapLog("[cemu] executable memory: 2 MiB-aligned direct memory can't be mapped RWX, experiment off\n");
+        g_largeCode = 0;
     }
     sceKernelReleaseDirectMemory(phys, size);
     return nullptr;
