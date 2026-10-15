@@ -12,6 +12,7 @@
 // - libc++abi runs thread_local destructors through __cxa_thread_atexit_impl, which the PS4
 //   libc lacks (and create-fself refuses unresolved imports).
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -179,6 +180,17 @@ mspace createDirectHeap(size_t size) {
     return createMspace("direct memory", base, size);
 }
 
+// Crema experiments read at start, before the heap exists: open/read (no allocation)
+bool switchOn(const char* path) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    char c = 0;
+    const ssize_t n = read(fd, &c, 1);
+    close(fd);
+    return n == 1 && c == '1';
+}
+
 mspace createHeap() {
     size_t available = 0;
     int32_t ret = sceKernelAvailableFlexibleMemorySize(&available);
@@ -194,6 +206,26 @@ mspace createHeap() {
     // Not all of it: the kernel's own objects ("ScePthread internal memory") and the system libc
     // heap that Sony modules (Piglet's shader compiler) grow on demand come from the same pool.
     // With a 1 GiB heap, compiling Dolphin's larger shaders ran the system out of memory.
+    // Crema experiment (/data/Crema/largeheap.txt = 1): the heap in 2 MiB-aligned direct memory at a
+    // fixed high address, so the CPU can map it with 2 MiB pages (far fewer TLB misses for the
+    // emulator's own data: caches, scheduler, the GPU command thread)
+    if (switchOn("/data/Crema/largeheap.txt")) {
+        const size_t largeSizes[] = {512 * MB, 384 * MB};
+        for (size_t size : largeSizes) {
+            off_t phys = 0;
+            if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
+                continue;
+            void* base = reinterpret_cast<void*>(0x1C00000000ull);
+            const int32_t r = sceKernelMapDirectMemory(&base, size, PROT_CPU_RW, 0, phys, 2 * MB);
+            if (r != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
+                heapLog("[cemu] heap: %zu MiB of 2 MiB-aligned direct memory not mapped (0x%x, %p)\n", size / MB, r, base);
+                sceKernelReleaseDirectMemory(phys, size);
+                continue;
+            }
+            if (mspace msp = createMspace("direct memory, 2 MiB pages", base, size))
+                return msp;
+        }
+    }
     const size_t systemSizes[] = {512 * MB, 384 * MB, 256 * MB, 192 * MB, 128 * MB};
     for (size_t size : systemSizes) {
         if (mspace msp = mapAndCreate(true, size))
@@ -699,6 +731,50 @@ void* mapDirectExecutable(size_t size, off_t* physOut = nullptr) {
     return base;
 }
 
+// Crema experiment (/data/Crema/largecode.txt = 1): the recompiler's code blocks in 2 MiB-aligned
+// direct memory mapped RWX at 2 MiB-aligned addresses, so the CPU can fetch the generated code
+// through 2 MiB pages (the hot code spreads over hundreds of 16 KiB pages otherwise). The first
+// block is checked to run code; if it doesn't, the experiment turns itself off.
+int g_largeCode = -1;  // -1: not read yet
+void* mapLargeExecutable(size_t len) {
+    if (g_largeCode < 0)
+        g_largeCode = switchOn("/data/Crema/largecode.txt") ? 1 : 0;
+    if (!g_largeCode)
+        return nullptr;
+    const size_t size = (len + 2 * MB - 1) & ~(2 * MB - 1);
+    off_t phys = 0;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0) {
+        heapLog("[cemu] mmap: no 2 MiB-aligned direct memory for %zu KiB of code\n", size / 1024);
+        return nullptr;
+    }
+    const uintptr_t hints[] = {0x1400000000ull, 0x1000000000ull, 0x800000000ull};
+    for (uintptr_t hint : hints) {
+        void* address = reinterpret_cast<void*>(hint);
+        if (sceKernelReserveVirtualRange(&address, size, 0, 2 * MB) != 0 || reinterpret_cast<uintptr_t>(address) < 0x400000000ull)
+            continue;
+        void* base = address;
+        if (sceKernelMapDirectMemory(&base, size, PROT_CPU_RWX, MAP_FIXED_FLAG, phys, 2 * MB) != 0 || base != address) {
+            sceKernelMunmap(address, size);
+            continue;
+        }
+        static bool s_checked = false;
+        if (!s_checked) {
+            s_checked = true;
+            if (!runsCode(base)) {
+                heapLog("[cemu] executable memory: 2 MiB-aligned direct memory does not run code, experiment off\n");
+                sceKernelMunmap(base, size);
+                sceKernelReleaseDirectMemory(phys, size);
+                g_largeCode = 0;
+                return nullptr;
+            }
+            heapLog("[cemu] executable memory: recompiler code in 2 MiB-aligned direct memory (largecode.txt)\n");
+        }
+        return base;
+    }
+    sceKernelReleaseDirectMemory(phys, size);
+    return nullptr;
+}
+
 ExecSource chooseExecSource() {
     SceKernelSwVersion version;
     memset(&version, 0, sizeof(version));
@@ -747,6 +823,11 @@ ExecSource chooseExecSource() {
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     const bool anonymous = fd == -1 && (flags & MAP_ANON) && !(flags & MAP_FIXED);
     if (anonymous && (prot & PROT_EXEC)) {
+        if (void* large = mapLargeExecutable(len)) {
+            heapLog("[cemu] mmap: %zu KiB prot %d from 2 MiB-aligned direct memory at %p, caller elf 0x%llx\n", len / 1024,
+                    prot, large, elf(__builtin_return_address(0)));
+            return large;
+        }
         static const ExecSource source = chooseExecSource();
         const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
         void* base = nullptr;
