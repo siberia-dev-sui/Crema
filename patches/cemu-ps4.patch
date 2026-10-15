@@ -1606,7 +1606,7 @@ index bfb2aed..66c27a0 100644
  // IML general
  
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..4b18208 100644
+index 89e805d..6a0729b 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -1701,14 +1701,23 @@ index 89e805d..4b18208 100644
  	for (size_t i = 0; i < basicBlockList.size(); i++)
  	{
  		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
-@@ -3171,6 +3197,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3171,6 +3197,24 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
  		cemu_assert_debug(ppcInstructionCount > 0);
 +		if (g_crema_fast_cycles)
 +		{
++			// A backward branch closes a loop: one count of the loop per iteration. Only when the
++			// loop fits in the function: the boundary tracker also follows an unconditional branch
++			// into code elsewhere (a thunk's tail jump), and counting the address gap charged BotW's
++			// 0x037da5fc ("b 0x030dfd24") 1.8 million cycles per call - its thread ended its
++			// timeslice on every call and the game froze. Such a block keeps its own count.
 +			if (basicBlockInfo.hasBranchTarget && basicBlockInfo.branchTarget <= basicBlockInfo.startAddress)
-+				ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.branchTarget + 4) / 4;
++			{
++				const uint32 loopLength = (basicBlockInfo.lastAddress - basicBlockInfo.branchTarget + 4) / 4;
++				if (loopLength <= functionInstructionCount)
++					ppcInstructionCount = loopLength;
++			}
 +			else if (basicBlockInfo.isEnterable)
 +				ppcInstructionCount = std::min<uint32>(functionInstructionCount, 64);
 +			else
@@ -1717,7 +1726,7 @@ index 89e805d..4b18208 100644
  
  		PPCRecompiler_pushBackIMLInstructions(seg, 0, 1);
  		seg->imlList[0].type = PPCREC_IML_TYPE_MACRO;
-@@ -3197,6 +3232,23 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3197,6 +3241,23 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  		ppcImlGenContext.currentBasicBlock = nullptr;
  	}
  
