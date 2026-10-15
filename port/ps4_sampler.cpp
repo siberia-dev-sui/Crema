@@ -835,3 +835,38 @@ extern "C" int ps4_thread_cpu_snapshot(const char** names, uint64_t* ns, int max
     }
     return n;
 }
+
+// Crema Live ("hostlayout"): the PS4 cores the app's threads may run on, changed while it runs.
+// "float": every thread on every app core (0-6), as by default. "pinned": each emulated Wii U core
+// on its own PS4 core (0, 1, 2), the GPU command thread on 3, Vulkan's recording thread on 4 and
+// every other thread on 4-6, so the busy threads never share a core.
+extern "C" void scePthreadSetaffinity();  // libkernel: (ScePthread, SceKernelCpumask)
+extern "C" int ps4_host_layout(int pinned, char* report, size_t size) {
+    using SetAffinity = int (*)(pthread_t, uint64_t);
+    auto setAffinity = reinterpret_cast<SetAffinity>(&scePthreadSetaffinity);
+    int changed = 0;
+    size_t length = 0;
+    report[0] = 0;
+    const int count = std::min(g_watched_count.load(std::memory_order_acquire), kMaxWatched);
+    for (int i = 0; i < count; i++) {
+        const pthread_t thread = g_watched[i].thread.load();
+        if (!thread)
+            continue;
+        const char* name = g_watched[i].name;
+        uint64_t mask = 0x7F;
+        if (pinned) {
+            mask = 0x70;
+            if (strcmp(name, "OSSched[core=0]") == 0) mask = 0x1;
+            else if (strcmp(name, "OSSched[core=1]") == 0) mask = 0x2;
+            else if (strcmp(name, "OSSched[core=2]") == 0) mask = 0x4;
+            else if (strcmp(name, "LatteThread") == 0) mask = 0x8;
+            else if (strcmp(name, "VkRecorder") == 0) mask = 0x10;
+        }
+        if (setAffinity(thread, mask) == 0)
+            changed++;
+        if (pinned && mask != 0x70 && length + 48 < size)
+            length += snprintf(report + length, size - length, "%s%s->%#llx", length ? ", " : "", name,
+                               static_cast<unsigned long long>(mask));
+    }
+    return changed;
+}
