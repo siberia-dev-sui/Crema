@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <sys/types.h>
@@ -1011,3 +1012,46 @@ size_t ps4rt_heap_footprint(void) {
 }
 
 }  // extern "C"
+
+// Crema Live ("cores"): how much time each app core has left. One thread per core (0-6), pinned
+// there at the lowest priority, counts loop iterations for `ms`: it only runs when nothing else
+// wants that core, so its count against the highest one shows the core's spare time.
+namespace {
+struct CoreProbe {
+    int core;
+    volatile bool* stop;
+    uint64_t count;
+};
+void* coreProbeRun(void* raw) {
+    CoreProbe* p = static_cast<CoreProbe*>(raw);
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), uint64_t{1} << p->core);
+    scePthreadSetprio(scePthreadSelf(), 767);
+    uint64_t n = 0;
+    while (!*p->stop) {
+        for (int i = 0; i < 1000; i++)
+            __asm__ volatile("" ::: "memory");
+        n++;
+    }
+    p->count = n;
+    return nullptr;
+}
+}  // namespace
+
+extern "C" int ps4_core_probe(int ms, uint64_t* counts, int maxCores) {
+    const int cores = maxCores < 7 ? maxCores : 7;
+    volatile bool stop = false;
+    CoreProbe probes[7];
+    pthread_t threads[7];
+    for (int c = 0; c < cores; c++) {
+        probes[c] = {c, &stop, 0};
+        if (__real_pthread_create(&threads[c], nullptr, coreProbeRun, &probes[c]) != 0)
+            return c;
+    }
+    usleep(ms * 1000);
+    stop = true;
+    for (int c = 0; c < cores; c++) {
+        pthread_join(threads[c], nullptr);
+        counts[c] = probes[c].count;
+    }
+    return cores;
+}
