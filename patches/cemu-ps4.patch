@@ -8095,10 +8095,10 @@ index 0000000..5b87a2d
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaLive.cpp b/src/gui/ps4/CremaLive.cpp
 new file mode 100644
-index 0000000..fef4087
+index 0000000..5b3371e
 --- /dev/null
 +++ b/src/gui/ps4/CremaLive.cpp
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,587 @@
 +// Crema Live: change emulation and recompiler settings while a game runs, from a computer on the
 +// same network, and measure each change without restarting the game.
 +//
@@ -8129,6 +8129,7 @@ index 0000000..fef4087
 +//   set code_spread <bytes> functions compiled afterwards each start on a new page of this size
 +//                           (power of 2 up to 65536; 0: packed, as usual)
 +//   hud <text>              a line for the Live Log panel (empty: none)
++//   set live_log 0|1        the Live Log panel on screen (until the game restarts)
 +//   mark <text>             a line in log.txt
 +// Recompiler settings only apply to code compiled afterwards: "inval" the hot functions (or
 +// "flush") after changing them. Old code is never freed, since a thread may still run it.
@@ -8164,6 +8165,7 @@ index 0000000..fef4087
 +extern std::atomic<sint32> g_crema_ra_scan;
 +extern std::atomic<uint64> g_crema_jit_code_bytes; // Recompiler/BackendX64/BackendX64.cpp
 +extern std::atomic<uint32> g_crema_code_spread;
++extern bool g_crema_live_log; // HW/Latte/Core/LatteOverlay.cpp
 +extern std::atomic<bool> g_crema_count_branches; // Recompiler/BackendX64/BackendX64.cpp
 +extern uint64 g_crema_branch_counts[2];
 +extern std::atomic<uint64_t> g_crema_presents; // HW/Latte/Renderer/Vulkan/PS4WSI.cpp
@@ -8255,6 +8257,8 @@ index 0000000..fef4087
 +			g_crema_framegen = number != 0;
 +		else if (name == "code_spread" && number <= 65536 && (number & (number - 1)) == 0)
 +			g_crema_code_spread = (uint32)number;
++		else if (name == "live_log")
++			g_crema_live_log = number != 0;
 +		else if (name.rfind("fg_", 0) == 0)
 +		{
 +			static const char* kNames[kCremaFgParamCount] = {"fg_disagree_low", "fg_disagree_high", "fg_still", "fg_vectors", "fg_radius", "fg_penalty_coarse", "fg_penalty_fine", "fg_phase", "fg_average"};
