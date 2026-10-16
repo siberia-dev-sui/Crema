@@ -27,6 +27,9 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <utility>
+#include <vector>
 #include <sys/types.h>
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes.
@@ -137,11 +140,11 @@ mspace createMspace(const char* pool, void* base, size_t size) {
 // The PS4 kernel library allocates its own objects (pthread attributes, ...) at 0x200000000,
 // where a kernel-placed reservation of ours also lands; those allocations wiped the heap's
 // control block. Ask for an address well above that instead.
-void* reserveAwayFromKernel(size_t size) {
+void* reserveAwayFromKernel(size_t size, size_t alignment = PAGE) {
     const uintptr_t hints[] = {0x1000000000ull, 0x800000000ull, 0x600000000ull};
     for (uintptr_t hint : hints) {
         void* address = reinterpret_cast<void*>(hint);
-        if (sceKernelReserveVirtualRange(&address, size, 0, PAGE) == 0) {
+        if (sceKernelReserveVirtualRange(&address, size, 0, alignment) == 0) {
             if (reinterpret_cast<uintptr_t>(address) >= 0x400000000ull)
                 return address;
             heapLog("[cemu] heap: reservation hint %p gave %p, trying another\n", reinterpret_cast<void*>(hint),
@@ -695,8 +698,12 @@ bool runsCode(void* code, void* writeAt = nullptr) {
     return !g_probeFaulted;
 }
 
-void* mapSystemPoolExecutable(size_t size) {
-    void* base = reserveAwayFromKernel(size);
+// large: 2 MiB-aligned and touched all through (largecode.txt): FreeBSD maps such memory with 2 MiB
+// pages when its kernel promotes superpages (codebench in Crema Live tells)
+void* mapSystemPoolExecutable(size_t size, bool large = false) {
+    if (large)
+        size = (size + 2 * MB - 1) & ~(2 * MB - 1);
+    void* base = reserveAwayFromKernel(size, large ? 2 * MB : PAGE);
     if (!base)
         return nullptr;
     const int32_t ret = sceKernelMapNamedSystemFlexibleMemory(&base, size, PROT_CPU_RWX, MAP_FIXED_FLAG, "cemu code");
@@ -706,6 +713,8 @@ void* mapSystemPoolExecutable(size_t size) {
         sceKernelMunmap(base, size);
         return nullptr;
     }
+    if (large)
+        memset(base, 0xCC, size);
     return base;
 }
 
@@ -852,6 +861,53 @@ ExecSource chooseExecSource() {
 
 }  // namespace
 
+// Crema Live "codebench": the time of one jump to another 16 KiB page of code, over 2048 pages
+// (32 MiB) in a random order (one cache line each: the code stays in the L2 cache, only the
+// instruction TLB misses). Once with executable memory as usual, once 2 MiB-aligned and touched all
+// through: if the kernel maps that with 2 MiB pages (FreeBSD superpages), the second time is lower.
+extern "C" int ps4_code_bench(char* report, size_t reportSize) {
+    constexpr size_t kLen = 32 * MB, kPageSize = 16 * 1024, kPages = kLen / kPageSize;
+    constexpr int kRounds = 64;
+    std::vector<uint32_t> order(kPages);
+    for (size_t i = 0; i < kPages; i++)
+        order[i] = static_cast<uint32_t>(i);
+    uint32_t seed = 12345;
+    for (size_t i = kPages - 1; i > 0; i--) {
+        seed = seed * 1103515245u + 12345u;
+        std::swap(order[i], order[seed % (i + 1)]);
+    }
+    double ns[2] = {-1.0, -1.0};
+    for (int variant = 0; variant < 2; variant++) {
+        void* base = mapSystemPoolExecutable(kLen, variant == 1);
+        if (!base)
+            continue;
+        if (variant == 0)
+            memset(base, 0xCC, kLen);
+        auto at = [&](size_t i) { return static_cast<uint8_t*>(base) + order[i] * kPageSize + (i & 63) * 64; };
+        for (size_t i = 0; i < kPages; i++) {
+            uint8_t* p = at(i);
+            if (i + 1 < kPages) {
+                const int32_t rel = static_cast<int32_t>(at(i + 1) - (p + 5));
+                p[0] = 0xE9;  // jmp rel32
+                memcpy(p + 1, &rel, 4);
+            } else {
+                p[0] = 0xC3;  // ret
+            }
+        }
+        void (*volatile entry)() = reinterpret_cast<void (*)()>(at(0));
+        entry();
+        entry();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < kRounds; r++)
+            entry();
+        ns[variant] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / (kRounds * kPages);
+        sceKernelMunmap(base, kLen);
+    }
+    snprintf(report, reportSize, "codebench %.2f ns per jump to another page with the usual code memory, %.2f ns 2 MiB-aligned and touched (%zu pages of 16 KiB)",
+             ns[0], ns[1], kPages);
+    return 0;
+}
+
 // Crema experiment (/data/Crema/largecode.txt = 1), second way: the PS4 refuses mapping direct memory
 // writable and executable at once (0x80020016), so each recompiler code block gets two views of the
 // same 2 MiB-aligned direct memory: read+execute where the code runs (fetched through 2 MiB pages:
@@ -920,10 +976,11 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
             return large;
         }
         static const ExecSource source = chooseExecSource();
+        static const bool s_largeCode = switchOn("/data/Crema/largecode.txt");
         const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
         void* base = nullptr;
         if (source == kExecSystemPool)
-            base = mapSystemPoolExecutable(size);
+            base = mapSystemPoolExecutable(size, s_largeCode);
         else if (source == kExecDirect)
             base = mapDirectExecutable(size);
         if (base) {
