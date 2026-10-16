@@ -26,6 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <utility>
@@ -861,32 +862,31 @@ ExecSource chooseExecSource() {
 
 }  // namespace
 
-// Crema Live "codebench": the time of one jump to another 16 KiB page of code, over 2048 pages
-// (32 MiB) in a random order (one cache line each: the code stays in the L2 cache, only the
-// instruction TLB misses). Once with executable memory as usual, once 2 MiB-aligned and touched all
-// through: if the kernel maps that with 2 MiB pages (FreeBSD superpages), the second time is lower.
+// Crema Live "codebench": the time of one jump to another 4 KiB page of code, in a random order over
+// 16 to 16384 pages (64 KiB to 64 MiB, one cache line each). Where the time climbs, the instruction
+// TLB no longer holds the pages: the generated code (~100 MB) pays that on each call to code far away.
 extern "C" int ps4_code_bench(char* report, size_t reportSize) {
-    constexpr size_t kLen = 32 * MB, kPageSize = 16 * 1024, kPages = kLen / kPageSize;
-    constexpr int kRounds = 64;
-    std::vector<uint32_t> order(kPages);
-    for (size_t i = 0; i < kPages; i++)
-        order[i] = static_cast<uint32_t>(i);
-    uint32_t seed = 12345;
-    for (size_t i = kPages - 1; i > 0; i--) {
-        seed = seed * 1103515245u + 12345u;
-        std::swap(order[i], order[seed % (i + 1)]);
+    constexpr size_t kPageSize = 4096, kMaxPages = 16384, kLen = kMaxPages * kPageSize;
+    void* base = mapSystemPoolExecutable(kLen);
+    if (!base) {
+        snprintf(report, reportSize, "codebench: no executable memory");
+        return -1;
     }
-    double ns[2] = {-1.0, -1.0};
-    for (int variant = 0; variant < 2; variant++) {
-        void* base = mapSystemPoolExecutable(kLen, variant == 1);
-        if (!base)
-            continue;
-        if (variant == 0)
-            memset(base, 0xCC, kLen);
+    memset(base, 0xCC, kLen);
+    std::vector<uint32_t> order(kMaxPages);
+    int len = snprintf(report, reportSize, "codebench ns per jump to another 4 KiB page of code:");
+    for (size_t pages = 16; pages <= kMaxPages && len > 0 && static_cast<size_t>(len) < reportSize; pages *= 4) {
+        for (size_t i = 0; i < pages; i++)
+            order[i] = static_cast<uint32_t>(i);
+        uint32_t seed = 12345;
+        for (size_t i = pages - 1; i > 0; i--) {
+            seed = seed * 1103515245u + 12345u;
+            std::swap(order[i], order[seed % (i + 1)]);
+        }
         auto at = [&](size_t i) { return static_cast<uint8_t*>(base) + order[i] * kPageSize + (i & 63) * 64; };
-        for (size_t i = 0; i < kPages; i++) {
+        for (size_t i = 0; i < pages; i++) {
             uint8_t* p = at(i);
-            if (i + 1 < kPages) {
+            if (i + 1 < pages) {
                 const int32_t rel = static_cast<int32_t>(at(i + 1) - (p + 5));
                 p[0] = 0xE9;  // jmp rel32
                 memcpy(p + 1, &rel, 4);
@@ -897,14 +897,17 @@ extern "C" int ps4_code_bench(char* report, size_t reportSize) {
         void (*volatile entry)() = reinterpret_cast<void (*)()>(at(0));
         entry();
         entry();
+        const size_t rounds = std::max<size_t>(4, (1u << 21) / pages);
         const auto t0 = std::chrono::steady_clock::now();
-        for (int r = 0; r < kRounds; r++)
+        for (size_t r = 0; r < rounds; r++)
             entry();
-        ns[variant] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / (kRounds * kPages);
-        sceKernelMunmap(base, kLen);
+        const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() /
+                          static_cast<double>(rounds * pages);
+        len += snprintf(report + len, reportSize - len, " %zu pages %.1f |", pages, ns);
+        for (size_t i = 0; i < pages; i++)
+            *at(i) = 0xCC;
     }
-    snprintf(report, reportSize, "codebench %.2f ns per jump to another page with the usual code memory, %.2f ns 2 MiB-aligned and touched (%zu pages of 16 KiB)",
-             ns[0], ns[1], kPages);
+    sceKernelMunmap(base, kLen);
     return 0;
 }
 
