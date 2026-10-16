@@ -167,7 +167,7 @@ player has.
 | Group | Highlights |
 |---|---|
 | Display | TV Shows (TV or GamePad screen), touch pointer, FPS counter, VSync, picture size, upscaling filter |
-| Emulation | CPU mode (Auto, multi-core, single-core), thread quantum, shader compilation, graphics accuracy, console language, Mii data, compare results, thread fairness |
+| Emulation | CPU mode (Auto, multi-core, single-core), thread quantum, shader compilation, graphics accuracy, console language, Mii data, compare results, thread fairness, Vulkan thread |
 | Audio | Game volume, GamePad speaker, audio buffer |
 | Controls | Touchpad mode (touch screen or Minus / HOME), motion controls |
 | Online | Off, Pretendo or a private server (with its address), and whether each one's files are there |
@@ -226,7 +226,7 @@ switch off unless noted. The settings named here are applied for you (see
 
 | Status | Game | FPS |
 |---|---|---|
-| ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | The Legend of Zelda: Breath of the Wild | 20–24 (its normal rate is 30) with *Graphics Accuracy: Fast*, *Thread Quantum: 100000* and the **FPS++** and **Draw Distance** graphic packs. The first 2–3 minutes after loading are slow while its code is compiled. |
+| ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | The Legend of Zelda: Breath of the Wild | 20–24 (its normal rate is 30) with *Graphics Accuracy: Fast*, *Thread Quantum: 100000*, *Vulkan Thread: On* and the **FPS++** and **Draw Distance** graphic packs. The first 2–3 minutes after loading are slow while its code is compiled. |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Donkey Kong Country: Tropical Freeze | Menus ~20, cutscenes ~45 (measured with diagnostics on); smooth with them off. *Thread Quantum: 100000*. |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Mario Kart 8 | Races 45–52, menus 60 |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Minecraft: Wii U Edition | ~37 with its update, 15+ minutes without a problem. *Thread Fairness: Off*. |
