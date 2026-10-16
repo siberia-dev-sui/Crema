@@ -106,15 +106,18 @@ set *Apply To* to *This Game*; the game keeps its own copy from then on.
 - **Shader Compilation**: *Asynchronous* means no stutter, but objects may appear a moment late.
 - **Compare Results**: *Fast*; use *Exact* if a game misbehaves.
 - **Thread Fairness**: only for games that need it (Tekken Tag Tournament 2).
+- **Vulkan Thread**: *On* is faster in games where the GPU thread is the slowest (Breath of the Wild:
+  about 15%). Off by default.
 - **VSync**: *On* removes tearing, at a little delay.
 - **Diagnostics**: keep everything *Off* for the best speed. Turn them on only to report a problem.
 
 **Which settings are best for my game?**
 The tested ones are in [`game-settings.ini`](game-settings.ini) and the
 [compatibility table](README.md#game-compatibility). For *Breath of the Wild*: *Graphics Accuracy:
-Fast*, *Thread Quantum: 100000*, and the **FPS++** (Normal) and **Draw Distance** graphic packs
-(NPCs Very Low, Terrain Low, Trees Potato, Grass Potato). For *Donkey Kong Country: Tropical
-Freeze*: *Thread Quantum: 100000*. For *Tekken Tag Tournament 2*: *Thread Fairness: On*.
+Fast*, *Thread Quantum: 100000*, *Vulkan Thread: On*, and the **FPS++** (Normal) and **Draw
+Distance** graphic packs (NPCs Very Low, Terrain Low, Trees Potato, Grass Potato). For *Donkey Kong
+Country: Tropical Freeze*: *Thread Quantum: 100000*. For *Tekken Tag Tournament 2*: *Thread
+Fairness: On*.
 
 **How do graphic packs work?**
 **Triangle on a game → Graphic Packs.** Cemu's community packs are downloaded the first time, and
