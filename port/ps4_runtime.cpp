@@ -283,12 +283,29 @@ mspace g_overflow = nullptr;
 uintptr_t g_overflowBase = 0;
 size_t g_overflowSize = 0;
 bool g_overflowTried = false;
+bool g_overflowDone = false;  // the attempt is over (g_overflow is set, or there's none)
+__thread bool t_creatingOverflow = false;
 
 mspace overflowHeap() {
     if (mspace msp = __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE))
         return msp;
-    if (__atomic_exchange_n(&g_overflowTried, true, __ATOMIC_ACQ_REL))
-        return __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);  // another thread is (or was) at it
+    if (__atomic_exchange_n(&g_overflowTried, true, __ATOMIC_ACQ_REL)) {
+        // Another thread is mapping it (~30 ms for 512 MiB): wait. Returning null meanwhile made a
+        // second thread's allocation fail when the main heap filled up (std::bad_alloc, the app
+        // closed while the overflow heap was being created).
+        if (t_creatingOverflow)
+            return nullptr;  // this thread is the one creating it (an allocation on the way)
+        while (!__atomic_load_n(&g_overflowDone, __ATOMIC_ACQUIRE))
+            sched_yield();
+        return __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);
+    }
+    t_creatingOverflow = true;
+    struct Done {
+        ~Done() {
+            t_creatingOverflow = false;
+            __atomic_store_n(&g_overflowDone, true, __ATOMIC_RELEASE);
+        }
+    } done;
     const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
     for (size_t size : sizes) {
         off_t phys = 0;
