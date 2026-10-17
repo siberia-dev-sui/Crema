@@ -106,12 +106,22 @@ unsigned long long elf(const void* address) {
                                            reinterpret_cast<uintptr_t>(__text_start));
 }
 
+// The first frame of this thread (startOnAppCores sets it; 0: a thread it didn't start). The page
+// above a thread's stack isn't mapped: logStack must not read past it.
+__thread uintptr_t t_stackTop = 0;
+
 // Logs the code addresses on the current stack (no frame pointers in release builds).
 void logStack() {
     const uintptr_t base = reinterpret_cast<uintptr_t>(__text_start);
     const auto* stack = static_cast<const uintptr_t*>(__builtin_frame_address(0));
+    // A heap failure on a shallow stack (the recompiler threads') read past its top and crashed
+    // the app right after "main heap full".
+    int words = 512;
+    const uintptr_t from = reinterpret_cast<uintptr_t>(stack);
+    if (t_stackTop > from && (t_stackTop - from) / sizeof(uintptr_t) < static_cast<uintptr_t>(words))
+        words = static_cast<int>((t_stackTop - from) / sizeof(uintptr_t));
     int found = 0;
-    for (int i = 0; i < 512 && found < 16; i++) {
+    for (int i = 0; i < words && found < 16; i++) {
         if (stack[i] >= base && stack[i] < base + 0x1000000) {
             heapLog("[cemu] heap:   stack elf 0x%llx\n", static_cast<unsigned long long>(stack[i] - base));
             found++;
@@ -1134,6 +1144,7 @@ constexpr uint64_t kEmulationCluster = 0x0F & kAppCores;
 constexpr uint64_t kHelperCluster = 0xF0 & kAppCores;
 
 void* startOnAppCores(void* raw) {
+    t_stackTop = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
     reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(),
